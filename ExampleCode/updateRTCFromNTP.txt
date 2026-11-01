@@ -1,0 +1,355 @@
+
+#define TINY_GSM_MODEM_SIM7600
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <RTClib.h>
+#include <TinyGsmClient.h>
+
+// ================= CONFIG =================
+
+// RTC I2C
+#define I2C_SDA 21
+#define I2C_SCL 22
+
+// SIM7600 UART
+#define SerialMon Serial
+#define SerialAT  Serial1
+
+#define MODEM_TX 17
+#define MODEM_RX 16
+
+// GSM APN
+const char APN[]  = "internet";
+const char USER[] = "";
+const char PASS[] = "";
+
+// NTP
+#define NTP_SERVER "pool.ntp.org"
+#define NTP_TIMEZONE 24  // Bangladesh UTC+6
+
+// Print interval
+#define RTC_PRINT_INTERVAL 1000
+
+// ================= OBJECTS =================
+
+RTC_DS3231 rtc;
+TinyGsm modem(SerialAT);
+
+// ================= STATUS =================
+
+bool rtcReady = false;
+bool modemReady = false;
+
+// ================= AT COMMAND =================
+
+// Send AT command and collect response until OK/ERROR
+String sendAT(String command, uint32_t timeout = 5000) {
+
+    while (SerialAT.available()) {
+        SerialAT.read();
+    }
+
+    SerialMon.print("[AT] ");
+    SerialMon.println(command);
+
+    SerialAT.println(command);
+
+    String response;
+    uint32_t start = millis();
+
+    while (millis() - start < timeout) {
+
+        while (SerialAT.available()) {
+            response += (char)SerialAT.read();
+        }
+
+        if (response.indexOf("\r\nOK\r\n") >= 0 ||
+            response.indexOf("\r\nERROR\r\n") >= 0) {
+            break;
+        }
+
+        delay(10);
+    }
+
+    SerialMon.println(response);
+
+    return response;
+}
+
+// ================= RTC FUNCTIONS =================
+
+// Print current RTC time
+void printRTC() {
+
+    if (!rtcReady) {
+        SerialMon.println("[RTC] Not available!");
+        return;
+    }
+
+    DateTime now = rtc.now();
+
+    char buffer[30];
+
+    snprintf(buffer, sizeof(buffer),
+             "%04d-%02d-%02d %02d:%02d:%02d",
+             now.year(),
+             now.month(),
+             now.day(),
+             now.hour(),
+             now.minute(),
+             now.second());
+
+    SerialMon.print("[RTC] ");
+    SerialMon.println(buffer);
+}
+
+// Get timestamp as String
+String getRTCTime() {
+
+    if (!rtcReady) return "";
+
+    DateTime now = rtc.now();
+
+    char buffer[25];
+
+    snprintf(buffer, sizeof(buffer),
+             "%04d-%02d-%02d %02d:%02d:%02d",
+             now.year(),
+             now.month(),
+             now.day(),
+             now.hour(),
+             now.minute(),
+             now.second());
+
+    return String(buffer);
+}
+
+// ================= MODEM INIT =================
+
+bool initModem() {
+
+    SerialMon.println("\n[MODEM] Starting SIM7600...");
+
+    modem.restart();
+
+    SerialMon.println(modem.getModemInfo());
+
+    modemReady = true;
+
+    return true;
+}
+
+// ================= NTP UPDATE =================
+
+// Call this function anytime from your firmware.
+// This function is blocking during synchronization.
+
+bool updateRTCFromNTP() {
+
+    SerialMon.println("\n========== RTC NTP UPDATE ==========");
+
+    if (!rtcReady) {
+        SerialMon.println("[RTC] RTC not initialized!");
+        return false;
+    }
+
+    if (!modemReady) {
+        SerialMon.println("[MODEM] Modem not initialized!");
+        return false;
+    }
+
+    // 1. Check mobile network
+    SerialMon.println("[MODEM] Checking network...");
+
+    if (!modem.isNetworkConnected()) {
+
+        if (!modem.waitForNetwork(60000L)) {
+            SerialMon.println("[MODEM] Network connection FAILED!");
+            return false;
+        }
+    }
+
+    SerialMon.println("[MODEM] Network connected.");
+
+    // 2. Connect GPRS
+    if (!modem.isGprsConnected()) {
+
+        SerialMon.println("[GPRS] Connecting...");
+
+        if (!modem.gprsConnect(APN, USER, PASS)) {
+            SerialMon.println("[GPRS] Connection FAILED!");
+            return false;
+        }
+    }
+
+    SerialMon.println("[GPRS] Connected.");
+
+    // 3. Configure NTP
+    String command = "AT+CNTP=\"" +
+                     String(NTP_SERVER) + "\"," +
+                     String(NTP_TIMEZONE);
+
+    String response = sendAT(command);
+
+    if (response.indexOf("OK") < 0) {
+        SerialMon.println("[NTP] Configuration FAILED!");
+        return false;
+    }
+
+    // 4. Request NTP synchronization
+    SerialMon.println("[NTP] Requesting time...");
+
+    while (SerialAT.available()) SerialAT.read();
+
+    SerialAT.println("AT+CNTP");
+
+    String result = "";
+    bool ntpSuccess = false;
+
+    uint32_t start = millis();
+
+    // Wait up to 60 seconds for NTP response
+    while (millis() - start < 60000) {
+
+        while (SerialAT.available()) {
+
+            char c = SerialAT.read();
+
+            result += c;
+            SerialMon.write(c);
+        }
+
+        if (result.indexOf("+CNTP: 0") >= 0) {
+            ntpSuccess = true;
+            break;
+        }
+
+        if (result.indexOf("+CNTP:") >= 0 &&
+            result.indexOf("+CNTP: 0") < 0) {
+            break;
+        }
+
+        delay(20);
+    }
+
+    if (!ntpSuccess) {
+        SerialMon.println("\n[NTP] Synchronization FAILED!");
+        return false;
+    }
+
+    SerialMon.println("\n[NTP] Synchronization successful.");
+
+    // 5. Read synchronized modem clock
+    response = sendAT("AT+CCLK?");
+
+    int year, month, day;
+    int hour, minute, second;
+
+    char *clockPosition = strstr(
+        response.c_str(), "+CCLK: \""
+    );
+
+    if (clockPosition == nullptr) {
+        SerialMon.println("[NTP] Cannot read modem clock!");
+        return false;
+    }
+
+    clockPosition += strlen("+CCLK: \"");
+
+    int parsed = sscanf(clockPosition,
+                        "%2d/%2d/%2d,%2d:%2d:%2d",
+                        &year, &month, &day,
+                        &hour, &minute, &second);
+
+    if (parsed != 6) {
+        SerialMon.println("[NTP] Invalid time format!");
+        return false;
+    }
+
+    // SIM7600 clock year is YY
+    year += 2000;
+
+    // Basic date/time validation
+    if (month < 1 || month > 12 ||
+        day < 1 || day > 31 ||
+        hour > 23 || minute > 59 || second > 59) {
+
+        SerialMon.println("[NTP] Invalid date/time!");
+        return false;
+    }
+
+    // 6. Update DS3231
+    rtc.adjust(DateTime(year, month, day,
+                        hour, minute, second));
+
+    SerialMon.println("\n[RTC] Updated successfully!");
+
+    printRTC();
+
+    SerialMon.println("====================================");
+
+    return true;
+}
+
+// ================= SETUP =================
+
+void setup() {
+
+    SerialMon.begin(115200);
+    delay(1000);
+
+    SerialMon.println("\nESP32 + DS3231 + SIM7600");
+    SerialMon.println("RTC TIME MANAGEMENT");
+
+    // Initialize I2C
+    Wire.begin(I2C_SDA, I2C_SCL);
+
+    // Initialize RTC
+    SerialMon.println("\n[RTC] Initializing...");
+
+    if (!rtc.begin()) {
+        SerialMon.println("[RTC] DS3231 NOT FOUND!");
+    } else {
+
+        rtcReady = true;
+
+        SerialMon.println("[RTC] DS3231 READY.");
+
+        if (rtc.lostPower()) {
+            SerialMon.println("[RTC] Battery/time lost!");
+            SerialMon.println("[RTC] NTP synchronization required.");
+        }
+
+        printRTC();
+    }
+
+    // Initialize SIM7600
+    SerialAT.begin(115200, SERIAL_8N1,
+                   MODEM_RX, MODEM_TX);
+
+    delay(3000);
+
+    initModem();
+
+    SerialMon.println("\nSystem ready.");
+
+    // Optional: synchronize once at startup
+    // updateRTCFromNTP();
+}
+
+// ================= LOOP =================
+
+void loop() {
+
+    static unsigned long previousPrint = 0;
+
+    if (millis() - previousPrint >= RTC_PRINT_INTERVAL) {
+
+        previousPrint = millis();
+
+        printRTC();
+    }
+
+    // Other firmware tasks can run here.
+}

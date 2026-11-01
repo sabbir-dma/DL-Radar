@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Industrial Data Logger</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header class="app-header">
+    <div class="app-brand">
+        <div class="app-logo">
+            <!-- <p>DMA</p> -->
+            <img src="data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBQYFBAYGBQYHBwYIChAKCgkJChQODwwQFxQYGBcUFhYaHSUfGhsjHBYWICwgIyYnKSopGR8tMC0oMCUoKSj/2wBDAQcHBwoIChMKChMoGhYaKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCj/wgARCABIAEgDASIAAhEBAxEB/8QAGgABAAMBAQEAAAAAAAAAAAAAAAMFBgQCAf/EABYBAQEBAAAAAAAAAAAAAAAAAAABAv/aAAwDAQACEAMQAAACssmg1kKATwDZsmzYC11Ir7s5c2fm9/DP1+6zVlUKevI0vXj9Lm9nytnsZzyAongALSrN5DGidGtyZLzjUAdBGsGb/9oADAMBAAIAAwAAACGfzyzD1JlXyw40/wA0898zC88jB//aAAwDAQACAAMAAAAQF/8A7Q/McM//AO697/X9z/J3/wD+D//EACARAAICAAYDAAAAAAAAAAAAAAECABEDBBAhMUESEyD/2gAIAQIBAT8ARQo+Hw99oTQuFid+JZ6MVyTR1dOxvHwcRK9i8xV8RXxms7iZrx9nWhYDmYbHjVjQuEkmzP/EACARAAEDBAIDAAAAAAAAAAAAAAEAAhEDECBBBBIyUWH/2gAIAQMBAT8AJnAO9oCVACj4i3YuDpNqMd4lEzhQ47KE9N2AJThu4ElAQv/EADMQAAEDAgQACgsBAAAAAAAAAAIBAwQABRESEyEGFBUgIzFBQlKiECIwM0NRYXGBkcGS/9oACAEBAAE/Ar7duIjpM4LILy1IlPyCxfdM/uvOjyn45YsOmH2WrFduPDpPYJIHzVNeWRKddLvFj7CE8seW06PdLH0261SZ24Dla8ZdVR+DcYE6YzcX9JXINvw9yv8AtakcG4xp0Jm2v7SrjapMHcxzNeMermcHYbMyYqPrsCZsniqfcW4eVhgNWQuwtB2UkO5zPWlyuLivw2q5Ab6+Nys3zzUsO5w/WiSuMCnw3agXFuZmYfDSkJsTR1wihsw5iIwuxpmyeH0gRASECqJJ2pXBh+I208b7gjJx3I17KWdMuDhDbBQGU21z/lcmXHr5UPN8su1JOmW9wRugobK7a4f2uE78Rxtk2HBKTjsQL2UZEZKRqpEvavNg35iPbAb0y1QTLlTqX61y1cveZAyeHLU6/MSLYbemWqaZcq9SfX2HHWtP6/LmzGVjynWi7pYewhsrIltND3iwq+WhJ3Ss4C+nmqRDkR1weZMfxtzo8ORIVEZZMvxtVjtCQU1XcCfXy1//xAAnEAABAwIFBAMBAQAAAAAAAAABABEhMWFBUXGRsSAwgeEQwdGh8P/aAAgBAQABPyEYGQeZAZm6IjTwDQUHUJGg0DqKFDIyjxADMIvxJNoGA27BdmItQxG3ydE6mLwzXgj+L2qKbP2ryR/F7R0zqJvLLodVNTmq4UGoZv6agQXEpiRYkfpX0D/iC4nMSbAn9CgxDNXR6hMrnpz1cfMrEAViETJDLGTaTd0XP7g10etlB/pF/pHy+wNNHrdA6QS5kXkXZSsQJHJ6S6i4DarlT3vAbd0LU3AfVcdiomOHpG8xNqGB27A9nIvDE7IKCB2mgZG90TsvE81Opzl4jmoioodooGQvdf/EACUQAQACAgEDBAMBAQAAAAAAAAERITFBAFFhgSBxkaEQMMGx8P/aAAgBAQABPxBiLTHQw2tHl1L9GtN7GA7AepejFN7GA7I8zeAjqYaTZ5NwLc1LNnwEA7H6FTrUMWR7Ckff8gIaEmhuOXnFTlODmLXI8Ql4/prfz9cXMWqR5lDwAipJsxHLxmpwvoG/uEIFuYTYZk1PF4oMCRVFRcRMdCyzHQrHUD741f8ACNW++WYKVY6g/XFecDCsXRYXETHUt6tqEJFOZRQ4h1H5cPctf1Es4QXACoNy9kWsTrjIv0lmZB+JOJtzsUm23IQk6S3EAf4cxThFcACi3K0TZcb4gepe/qrb6WXjDlG2s5pMrA559PZ1Ph3PBTnDlOm8ZpMhIfoc/wB/5jE4j0tUH5Is+BgnZ/QwFegmJWdiS9jk1GpqfCaGvBqEmOtF0u4bHcfVMVYDgTtdDuvLMdV35Ta34FSv//4AAwD/2Q==" alt="IDL" width="40" height="40">
+        </div>
+        <div>
+            <h1>Industrial Data Logger</h1>
+            <p id="deviceSubtitle">Device configuration</p>
+        </div>
+    </div>
+    <div class="status">
+        <span id="statusDot"></span>
+        <span id="statusText">Loading...</span>
+    </div>
+</header>
+
+<nav class="tabs">
+    <button class="tab active" data-tab="device" onclick="switchTab('device')">
+        <span class="tab-icon">📊</span> Device
+    </button>
+    <button class="tab" data-tab="network" onclick="switchTab('network')">
+        <span class="tab-icon">⇄</span> Network
+    </button>
+    <button class="tab" data-tab="sensors" onclick="switchTab('sensors')">
+        <span class="tab-icon">⛁</span> Sensors
+        <span class="tab-badge" id="tabSensorBadge">0</span>
+    </button>
+</nav>
+
+<main>
+
+    <!-- ===== DEVICE TAB ===== -->
+    <section id="tab-device" class="tab-panel active">
+        <div class="card">
+            <div class="section-title">
+                <div>
+                    <h2>Device Identity</h2>
+                    <p>Basic identification of this logger unit.</p>
+                </div>
+            </div>
+            <div class="grid">
+                <label class="field">
+                    <span class="field-label">
+                        Device ID
+                        <span class="pill pill-locked">read-only</span>
+                    </span>
+                    <input id="deviceId" readonly class="readonly">
+                    <small class="field-help">Hardware serial number — cannot be changed.</small>
+                </label>
+                <label class="field">
+                    <span class="field-label">Device Name</span>
+                    <input id="deviceName" placeholder="e.g. Rooftop Weather Station">
+                    <small class="field-help">Friendly name shown on MQTT status messages.</small>
+                </label>
+            </div>
+        </div>
+    </section>
+
+    <!-- ===== NETWORK TAB ===== -->
+    <section id="tab-network" class="tab-panel">
+        <div class="card">
+            <div class="section-title">
+                <div>
+                    <h2>Cellular / APN</h2>
+                    <p>SIM credentials for the uplink modem.</p>
+                </div>
+            </div>
+            <div class="grid">
+                <label class="field">
+                    <span class="field-label">APN</span>
+                    <input id="apn" placeholder="internet">
+                </label>
+                <label class="field">
+                    <span class="field-label">APN User</span>
+                    <input id="apnUser">
+                </label>
+                <label class="field">
+                    <span class="field-label">APN Password</span>
+                    <input id="apnPass" type="password">
+                </label>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="section-title">
+                <div>
+                    <h2>MQTT Broker</h2>
+                    <p>Where logged data is published.</p>
+                </div>
+            </div>
+            <div class="grid">
+                <label class="field">
+                    <span class="field-label">Broker Host</span>
+                    <input id="broker" placeholder="mqtt.example.com">
+                </label>
+                <label class="field">
+                    <span class="field-label">Port</span>
+                    <input id="brokerPort" type="number" min="1" max="65535" placeholder="1883">
+                </label>
+                <label class="field">
+                    <span class="field-label">MQTT User</span>
+                    <input id="mqttUser">
+                </label>
+                <label class="field">
+                    <span class="field-label">MQTT Password</span>
+                    <input id="mqttPass" type="password">
+                </label>
+                <label class="field field-wide">
+                    <span class="field-label">Publish Topic</span>
+                    <input id="pubTopic" placeholder="logger/DL001/data">
+                </label>
+                <label class="field field-wide">
+                    <span class="field-label">Subscribe Topic</span>
+                    <input id="subTopic" placeholder="logger/DL001/cmd">
+                </label>
+                <label class="field field-wide">
+                    <span class="field-label">Ack Topic</span>
+                    <input id="ackTopic" placeholder="logger/DL001/ack">
+                </label>
+            </div>
+        </div>
+    </section>
+
+    <!-- ===== SENSORS TAB ===== -->
+    <section id="tab-sensors" class="tab-panel">
+        <div class="card">
+            <div class="section-title">
+                <div>
+                    <h2>Sensors</h2>
+                    <p id="sensorCount">0 / 12 sensors configured</p>
+                </div>
+                <div class="section-actions">
+                    <button class="secondary" onclick="collapseAllSensors()">Collapse all</button>
+                    <button onclick="addSensor()">+ Add Sensor</button>
+                </div>
+            </div>
+            <div id="sensors"></div>
+        </div>
+    </section>
+
+</main>
+
+<footer class="action-bar">
+    <div class="action-bar-info">
+        <span id="dirtyIndicator" class="dirty-pill">No unsaved changes</span>
+    </div>
+    <div class="action-bar-buttons">
+        <button class="secondary" onclick="loadConfig()">Reload</button>
+        <button class="danger" onclick="resetConfig()">Reset</button>
+        <button class="primary" onclick="saveConfig()">Save Configuration</button>
+    </div>
+</footer>
+
+<div id="message" class="message"></div>
+
+<script src="/script.js"></script>
+</body>
+</html>

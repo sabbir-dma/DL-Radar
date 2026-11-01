@@ -1,0 +1,73 @@
+{
+  "config_version": 2,
+  "device": {
+    "id": "DL002",
+    "name": "Industrial Data Logger"
+  },
+  "network": {
+    "apn": "",
+    "apn_user": "",
+    "apn_pass": "",
+    "broker": "",
+    "broker_port": 1883,
+    "mqtt_user": "",
+    "mqtt_pass": "",
+    "pub_topic": "",
+    "sub_topic": "",
+    "ack_topic": ""
+  },
+  "sensors": [
+    {
+      "id": 1,
+      "name": "Weather Station",
+      "sensor_enable": true,
+      "sd_logging": false,
+      "poll_interval_ms": 5000,
+      "sensor_type": "MODBUS",
+      "modbus": {
+        "slave_id": 1,
+        "baud": 9600,
+        "parity": "NONE",
+        "data_bits": 8,
+        "stop_bits": 1,
+        "retry_attempts": 3,
+        "recv_timeout_ms": 1000,
+        "min_interval_ms": 100,
+        "batch_read": false,
+        "batch_start": "0x0000",
+        "batch_reg_type": "HOLDING",
+        "batch_qty": 1
+      },
+      "channels": [
+        {
+          "id": 1,
+          "alias": "Temperature",
+          "description": "Ambient temperature",
+          "unit": "°C",
+          "register_address": "0x0001",
+          "register_type": "HOLDING",
+          "scale_factor": 0.1,
+          "offset": 0,
+          "data_type": "INT16",
+          "register_width": 1,
+          "bit_index": -1,
+          "byte_order": "BIG_ENDIAN"
+        },
+        {
+          "id": 2,
+          "alias": "Humidity",
+          "description": "Relative humidity",
+          "unit": "%RH",
+          "register_address": "0x0002",
+          "register_type": "HOLDING",
+          "scale_factor": 0.1,
+          "offset": 0,
+          "data_type": "UINT16",
+          "register_width": 1,
+          "bit_index": -1,
+          "byte_order": "BIG_ENDIAN"
+        }
+      ]
+    }
+  ]
+}
