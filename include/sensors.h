@@ -12,6 +12,7 @@ struct ChannelWriter {
     int     len;      // current write position
     bool    first;    // true until first channel written
     bool    anyOk;    // true if any channel was written
+    char   raw[256];
 };
 
 // Append a successful channel:  {"alias":"...","value":1.23,"unit":"V"}

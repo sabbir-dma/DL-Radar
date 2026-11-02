@@ -3,6 +3,7 @@
 #include "config_portal.h"
 #include "display.h"
 #include "radar.h"
+#include "storage.h"
 
 // ==================== Global Definitions ====================
 TaskHandle_t mainTaskHandle = NULL;
@@ -91,6 +92,7 @@ void setup() {
     Display_setup();
     GSM_setup();
     radar_setup();
+    storage_setup();
     initSensors();
 
     //////////////////////////////////////////////////////////////////
@@ -118,6 +120,7 @@ void setup() {
 void loop() {
     // FreeRTOS scheduler takes over - nothing to do here
     vTaskDelay(pdMS_TO_TICKS(1000));
+    storage_handlePeriodic();
     if (softAP_started) {
         server.handleClient();
         delay(2);
@@ -424,6 +427,9 @@ void publishHeartbeat() {
 
     bool acLine = digitalRead(ACLINE_PIN) == HIGH;
 
+    float solarV = storage_getSolarVoltage();
+    float battV  = storage_getBatteryVoltage();
+
     //Get Strength Level form RSSI
     int signalLevel = rssiToSignalLevel(csq);
 
@@ -448,7 +454,9 @@ void publishHeartbeat() {
                 "\"min_heap\":%d,"
                 "\"reset_reason\":\"%s\","
                 "\"cpu_mhz\":%d,"
-                "\"chip_temp\":%.1f"
+                "\"chip_temp\":%.1f,"
+                "\"solar_voltage\":%.3f,"
+                "\"battery_voltage\":%.3f"
             "}"
         "}",
         DEVICE_ID.c_str(),
@@ -462,7 +470,9 @@ void publishHeartbeat() {
         minHeap,
         resetReasonStr(),
         (int)ESP.getCpuFreqMHz(),
-        temperatureRead()
+        temperatureRead(),
+        solarV,
+        battV
     );
 
     if (len < 0 || len >= (int)sizeof(hbMsg.payload)) {

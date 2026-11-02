@@ -1,7 +1,9 @@
 #include "sensors.h"
 #include "modbus.h"
 #include "radar.h"
+#include "storage.h"
 #include "config.h"
+static String currentRawData = "";
 #include "timeutil.h"
 
 // ============================================================
@@ -122,7 +124,8 @@ void readAllSensorsAndPublish() {
             .bufSize = sizeof(jsonBuf),
             .len = len,
             .first = true,
-            .anyOk = false
+            .anyOk = false,
+            .raw = {0}
         };
 
         // ---- Dispatch ----
@@ -174,6 +177,9 @@ void readAllSensorsAndPublish() {
             Serial.println("[SENSORS] MQTT queue full");
         }
         Serial.flush();
+
+        // Log to SD card
+        storage_logData(String(name), String(w.raw));
     }
 
     Serial.println("[SENSORS] --- cycle done ---");
@@ -189,6 +195,9 @@ bool readSDI12Sensor(JsonObject sensor, ChannelWriter &w) {
 
     String rawData;
     bool ok = measureM3(rawData);
+
+    strncpy(w.raw, rawData.c_str(), sizeof(w.raw) - 1);
+    w.raw[sizeof(w.raw) - 1] = 0;
 
     // Sanitize raw data for JSON string (replace double quotes)
     String safe = rawData;
@@ -217,8 +226,8 @@ bool readSDI12Sensor(JsonObject sensor, ChannelWriter &w) {
     }
     w.len += written;
     w.first = false;
-    w.anyOk = true;
+    if (ok) w.anyOk = true;
 
-    return true;
+    return ok;
 }
 
