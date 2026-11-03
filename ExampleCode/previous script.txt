@@ -1,0 +1,126 @@
+const form = document.getElementById('retrieveForm');
+const startInput = document.getElementById('startDate');
+const endInput = document.getElementById('endDate');
+const retrieveBtn = document.getElementById('retrieveBtn');
+const btnText = document.getElementById('btnText');
+const resultPanel = document.getElementById('resultPanel');
+const errorPanel = document.getElementById('errorPanel');
+
+function localDateString(date) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+function prettyDate(value) {
+  if (!value) return '';
+  const [y, m, d] = value.split('-').map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString(undefined, {
+    day: 'numeric', month: 'short', year: 'numeric'
+  });
+}
+function updateRangeSummary() {
+  const start = startInput.value;
+  const end = endInput.value;
+  const label = document.getElementById('rangeLabel');
+  const days = document.getElementById('dayCount');
+
+  if (!start || !end) {
+    label.textContent = 'Choose your dates above';
+    days.textContent = '— days';
+    return;
+  }
+  if (start > end) {
+    label.textContent = 'End date must not be before start date';
+    days.textContent = 'Invalid';
+    return;
+  }
+  const startMs = new Date(`${start}T00:00:00`).getTime();
+  const endMs = new Date(`${end}T00:00:00`).getTime();
+  const totalDays = Math.round((endMs - startMs) / 86400000) + 1;
+  label.textContent = `${prettyDate(start)} — ${prettyDate(end)}`;
+  days.textContent = `${totalDays} ${totalDays === 1 ? 'day' : 'days'}`;
+}
+function setBusy(busy) {
+  retrieveBtn.disabled = busy;
+  btnText.textContent = busy ? 'Retrieving data…' : 'Retrieve selected data';
+  retrieveBtn.querySelector('.btn-icon').textContent = busy ? '◌' : '↓';
+}
+function showError(message) {
+  resultPanel.classList.add('hidden');
+  errorPanel.classList.remove('hidden');
+  document.getElementById('errorMessage').textContent = message || 'Please check the SD card and date range.';
+}
+function formatBytes(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+startInput.addEventListener('change', () => {
+  if (startInput.value) endInput.min = startInput.value;
+  updateRangeSummary();
+});
+endInput.addEventListener('change', () => {
+  if (endInput.value) startInput.max = endInput.value;
+  updateRangeSummary();
+});
+
+form.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  errorPanel.classList.add('hidden');
+  resultPanel.classList.add('hidden');
+
+  const start = startInput.value;
+  const end = endInput.value;
+  if (!start || !end) return showError('Please choose both a start date and an end date.');
+  if (start > end) return showError('The end date must be the same as or later than the start date.');
+
+  setBusy(true);
+  try {
+    const response = await fetch(`/api/retrieve?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`, {
+      method: 'GET',
+      cache: 'no-store'
+    });
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || 'The retrieve request failed.');
+
+    document.getElementById('resultTitle').textContent = 'Your file is ready';
+    document.getElementById('resultMessage').textContent = 'The matching records have been collected into one CSV file.';
+    document.getElementById('recordCount').textContent = Number(data.records).toLocaleString();
+    document.getElementById('fileSize').textContent = formatBytes(Number(data.bytes) || 0);
+    document.getElementById('fileName').textContent = data.filename || 'retrieve.csv';
+    document.getElementById('downloadBtn').href = data.downloadUrl || '/download';
+    resultPanel.classList.remove('hidden');
+    resultPanel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  } catch (error) {
+    showError(error.message);
+  } finally {
+    setBusy(false);
+  }
+});
+
+async function loadStatus() {
+  const status = document.getElementById('sdStatus');
+  try {
+    const response = await fetch('/api/status', { cache: 'no-store' });
+    const data = await response.json();
+    status.innerHTML = data.sdReady
+      ? '<span class="mini-dot" style="background:#17a673"></span>Ready'
+      : '<span class="mini-dot" style="background:#e05252"></span>Not detected';
+    if (!data.sdReady) showError('SD card is not ready. Check the card, wiring, and CS pin, then restart the ESP32.');
+  } catch (_) {
+    status.innerHTML = '<span class="mini-dot"></span>Unavailable';
+  }
+}
+
+const today = localDateString(new Date());
+startInput.max = today;
+endInput.max = today;
+endInput.value = today;
+const defaultStart = new Date();
+defaultStart.setDate(defaultStart.getDate() - 6);
+startInput.value = localDateString(defaultStart);
+endInput.min = startInput.value;
+updateRangeSummary();
+loadStatus();

@@ -11,7 +11,6 @@
 <header class="app-header">
     <div class="app-brand">
         <div class="app-logo">
-            <!-- <p>DMA</p> -->
             <img src="data:image/jpeg;base64,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" alt="IDL" width="40" height="40">
         </div>
         <div>
@@ -35,6 +34,12 @@
     <button class="tab" data-tab="sensors" onclick="switchTab('sensors')">
         <span class="tab-icon">⛁</span> Sensors
         <span class="tab-badge" id="tabSensorBadge">0</span>
+    </button>
+    <!-- <button class="tab" data-tab="storage" onclick="switchTab('storage')">
+        <span class="tab-icon">💾</span> Storage
+    </button> -->
+    <button class="tab" data-tab="data" onclick="switchTab('data')">
+        <span class="tab-icon">📥</span> Data
     </button>
 </nav>
 
@@ -148,6 +153,78 @@
             <div id="sensors"></div>
         </div>
     </section>
+
+    <!-- ===== DATA TAB ===== -->
+    <section id="tab-data" class="tab-panel">
+        <div class="card">
+            <div class="section-title">
+                <div>
+                    <h2>Data Retrieve</h2>
+                    <p>Download SD card CSV logs (file per month: <code>YYYYMM.csv</code>).</p>
+                </div>
+                <div class="section-actions">
+                    <button class="secondary" onclick="refreshSdFiles()">↻ Refresh files</button>
+                </div>
+            </div>
+
+            <div class="grid">
+                <label class="field">
+                    <span class="field-label">From date</span>
+                    <input type="date" id="dataFrom">
+                    <small class="field-help">Start date (inclusive).</small>
+                </label>
+                <label class="field">
+                    <span class="field-label">To date</span>
+                    <input type="date" id="dataTo">
+                    <small class="field-help">End date (inclusive).</small>
+                </label>
+                <!-- <label class="field">
+                    <span class="field-label">Sensor filter (optional)</span>
+                    <select id="dataSensorFilter">
+                        <option value="">All sensors</option>
+                    </select>
+                </label> -->
+            </div>
+
+            <div class="data-actions">
+                <button class="secondary" onclick="previewData()">Preview</button>
+                <button class="primary" onclick="downloadData()">⬇ Download</button>
+            </div>
+
+            <div id="sdFileList" class="sd-files"></div>
+
+            <div class="preview-header">
+                <strong>Preview</strong>
+                <span id="previewInfo" class="field-help"></span>
+            </div>
+            <div class="preview-wrap">
+                <table id="previewTable" class="preview-table">
+                    <thead></thead>
+                    <tbody></tbody>
+                </table>
+                <div id="previewEmpty" class="empty">
+                    <strong>No preview yet</strong>
+                    Select a date range and click <em>Preview</em>.
+                </div>
+            </div>
+        </div>
+    </section>
+    <!-- ===== STORAGE TAB ===== -->
+    <section id="tab-storage" class="tab-panel">
+        <div class="card">
+            <div class="section-title">
+                <div>
+                    <h2>SD Card Files</h2>
+                    <p id="sdStatus">Checking SD card...</p>
+                </div>
+                <div class="section-actions">
+                    <button class="secondary" onclick="loadSDFiles()">Reload</button>
+                </div>
+            </div>
+            <div id="sdFiles"></div>
+        </div>
+    </section>
+
 
 </main>
 

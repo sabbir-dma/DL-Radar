@@ -48,7 +48,8 @@ void storage_setup() {
     }
 
     sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-    if (!SD.begin(SD_CS, sdSPI, 10000000)) {
+    if (!SD.begin(SD_CS, sdSPI, 20000000) &&
+        !SD.begin(SD_CS, sdSPI, 10000000)) {
         Serial.println("[SD] Initialization FAILED!");
     } else {
         sdReady = true;

@@ -1,0 +1,574 @@
+/*
+ * ESP32 SD Range Retrieve Portal
+ * --------------------------------
+ * Soft-AP web portal that lets a user pick a date range and download a
+ * merged CSV built from per-month files on the SD card.
+ *
+ * Monthly source files : /YYYY_MM.csv   (first column = "timestamp")
+ * Output file          : /retrieve_<start>_<end>.csv  (deleted after download)
+ *
+ * Hardware
+ *   SD_CS_PIN     GPIO5
+ *   PORTAL_BUTTON GPIO35 (input-only, external 10k pull-up to 3V3 required)
+ */
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <LittleFS.h>
+#include <SPI.h>
+#include <SD.h>
+#include <time.h>
+
+// =====================================================================
+// Configuration
+// =====================================================================
+
+// SD card
+static const uint8_t  SD_CS_PIN        = 5;
+static const uint32_t SD_SPI_HZ        = 20000000;
+
+// Portal button (GPIO35 is input-only; needs an external 10k pull-up to 3V3)
+static const uint8_t  PORTAL_BUTTON    = 35;
+static const uint32_t BUTTON_DEBOUNCE_MS = 250;
+
+// Soft-AP
+static const char *AP_SSID     = "ESP32-Data-Retrieve";
+static const char *AP_PASSWORD = "12345678"; // >= 8 chars
+static const IPAddress AP_IP     (192, 168, 4, 1);
+static const IPAddress AP_GATEWAY(192, 168, 4, 1);
+static const IPAddress AP_SUBNET (255, 255, 255, 0);
+
+// CSV parsing
+static const size_t LINE_BUFFER_SIZE = 1024;
+
+// =====================================================================
+// Globals
+// =====================================================================
+
+WebServer server(80);
+
+bool     sdReady       = false;
+bool     portalRunning = false;
+bool     retrieveReady = false;
+String   currentOutputPath;
+String   currentOutputName;
+uint32_t lastRecordCount = 0;
+uint32_t lastByteCount   = 0;
+String   lastError;
+
+// =====================================================================
+// Small utilities
+// =====================================================================
+
+static void logBanner(const __FlashStringHelper *title) {
+  Serial.println();
+  Serial.println(F("=================================================="));
+  Serial.println(title);
+  Serial.println(F("=================================================="));
+}
+
+static void logKV(const __FlashStringHelper *key, const String &value) {
+  Serial.print(key);
+  Serial.println(value);
+}
+
+static String jsonEscape(const String &input) {
+  String out;
+  out.reserve(input.length() + 8);
+  for (size_t i = 0; i < input.length(); i++) {
+    char c = input[i];
+    if      (c == '"' || c == '\\') { out += '\\'; out += c; }
+    else if (c == '\n')             out += "\\n";
+    else if (c == '\r')             out += "\\r";
+    else if ((uint8_t)c >= 0x20)    out += c;
+  }
+  return out;
+}
+
+static String jsonField(const char *key, const String &value) {
+  return "\"" + String(key) + "\":\"" + jsonEscape(value) + "\"";
+}
+
+static void sendJson(int status, const String &body) {
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(status, "application/json; charset=utf-8", body);
+}
+
+// Advance (year, month) by one calendar month.
+static void nextMonth(int &year, int &month) {
+  if (++month > 12) { month = 1; ++year; }
+}
+
+// Build "/YYYY_MM.csv" into `out` (must be >= 16 bytes).
+static void monthlyFilePath(int year, int month, char *out, size_t outSize) {
+  snprintf(out, outSize, "/%04d_%02d.csv", year, month);
+}
+
+// =====================================================================
+// CSV timestamp handling
+// =====================================================================
+
+// "YYYY-MM-DD HH:MM:SS" -> "YYYYMMDDHHMMSS".
+// Timestamp must be the first CSV column.
+static bool timestampToCompact(const char *src, char *dst, size_t dstSize) {
+  if (!src || strlen(src) < 19 || dstSize < 15) return false;
+  if (src[4] != '-' || src[7] != '-' || src[10] != ' ' ||
+      src[13] != ':' || src[16] != ':') return false;
+
+  static const uint8_t idx[] = {0,1,2,3,5,6,8,9,11,12,14,15,17,18};
+  for (size_t i = 0; i < sizeof(idx); i++) {
+    char c = src[idx[i]];
+    if (c < '0' || c > '9') return false;
+    dst[i] = c;
+  }
+  dst[14] = '\0';
+  return true;
+}
+
+static bool validCompactTimestamp(const String &v) {
+  if (v.length() != 14) return false;
+  for (size_t i = 0; i < v.length(); i++)
+    if (!isDigit(v[i])) return false;
+  return true;
+}
+
+// Read one line. Returns false at EOF with no data. Overlong lines are
+// drained and reported as empty (caller skips them).
+static bool readCsvLine(File &file, char *line, size_t capacity, size_t &length) {
+  length = 0;
+  bool gotAny  = false;
+  bool overflow = false;
+
+  while (file.available()) {
+    int v = file.read();
+    if (v < 0) break;
+    gotAny = true;
+    char c = (char)v;
+    if (c == '\n') break;
+    if (length + 1 < capacity) line[length++] = c;
+    else                       overflow = true;
+  }
+
+  if (!gotAny) return false;
+  line[length] = '\0';
+  if (length && line[length - 1] == '\r') line[--length] = '\0';
+  if (overflow) length = 0;
+  return true;
+}
+
+// =====================================================================
+// Range retrieval
+// =====================================================================
+
+static bool failRetrieve(const String &message) {
+  lastError = message;
+  Serial.print(F("ERROR: "));
+  Serial.println(lastError);
+  return false;
+}
+
+// Verify every /YYYY_MM.csv that spans [startTime, endTime] exists.
+static bool verifyMonthlyFilesExist(const String &startTime, const String &endTime) {
+  const int startYear  = startTime.substring(0, 4).toInt();
+  const int startMonth = startTime.substring(4, 6).toInt();
+  const int endYear    = endTime.substring(0, 4).toInt();
+  const int endMonth   = endTime.substring(4, 6).toInt();
+
+  int year = startYear, month = startMonth;
+  while (year < endYear || (year == endYear && month <= endMonth)) {
+    char path[16];
+    monthlyFilePath(year, month, path, sizeof(path));
+
+    Serial.print(F("  "));
+    Serial.print(path);
+    if (!SD.exists(path)) {
+      Serial.println(F("  MISSING"));
+      return false;
+    }
+    Serial.println(F("  OK"));
+    nextMonth(year, month);
+  }
+  return true;
+}
+
+// Merge matching records from each monthly file into a temp CSV on SD.
+static bool retrieveRange(const String &startTime, const String &endTime) {
+  lastError = "";
+  lastRecordCount = 0;
+  lastByteCount   = 0;
+  retrieveReady   = false;
+
+  logBanner(F("RETRIEVE RANGE START"));
+  logKV(F("Start time: "), startTime);
+  logKV(F("End time:   "), endTime);
+
+  // Stage 1 — preconditions
+  if (!sdReady)                    return failRetrieve("SD card is not ready.");
+  if (!validCompactTimestamp(startTime) ||
+      !validCompactTimestamp(endTime))  return failRetrieve("Invalid date range.");
+  if (startTime > endTime)         return failRetrieve(
+                                        "Start date must be before or equal to end date.");
+
+  const int startYear  = startTime.substring(0, 4).toInt();
+  const int startMonth = startTime.substring(4, 6).toInt();
+  const int endYear    = endTime.substring(0, 4).toInt();
+  const int endMonth   = endTime.substring(4, 6).toInt();
+
+  // Stage 2 — verify all required monthly files exist
+  Serial.println();
+  Serial.println(F("----- CHECK REQUIRED FILES -----"));
+  if (!verifyMonthlyFilesExist(startTime, endTime)) {
+    char firstMissing[16];
+    // Re-scan to name the offender in the error message
+    int y = startYear, m = startMonth;
+    while (y < endYear || (y == endYear && m <= endMonth)) {
+      monthlyFilePath(y, m, firstMissing, sizeof(firstMissing));
+      if (!SD.exists(firstMissing)) break;
+      nextMonth(y, m);
+    }
+    return failRetrieve("Required monthly CSV file is missing: " + String(firstMissing));
+  }
+  Serial.println(F("All required monthly files exist."));
+
+  // Stage 3 — create output file
+  currentOutputName = "retrieve_" + startTime + "_" + endTime + ".csv";
+  currentOutputPath = "/" + currentOutputName;
+
+  Serial.print(F("Output path: "));
+  Serial.println(currentOutputPath);
+
+  if (SD.exists(currentOutputPath.c_str()) &&
+      !SD.remove(currentOutputPath.c_str())) {
+    return failRetrieve("Could not remove existing output file.");
+  }
+
+  File output = SD.open(currentOutputPath.c_str(), FILE_WRITE);
+  if (!output) return failRetrieve("Could not create output file on SD card.");
+
+  bool headerWritten = false;
+  bool readError     = false;
+  char line[LINE_BUFFER_SIZE];
+
+  // Stage 4 — stream matching records, month by month
+  int year = startYear, month = startMonth;
+  while (year < endYear || (year == endYear && month <= endMonth)) {
+    char path[16];
+    monthlyFilePath(year, month, path, sizeof(path));
+
+    Serial.println();
+    Serial.print(F("----- PROCESSING FILE: "));
+    Serial.print(path);
+    Serial.println(F(" -----"));
+
+    File input = SD.open(path, FILE_READ);
+    if (!input) {
+      readError = true;
+      lastError = "Failed to open monthly CSV file: " + String(path);
+      break;
+    }
+
+    size_t length      = 0;
+    size_t fileRecords = 0;
+
+    while (readCsvLine(input, line, sizeof(line), length)) {
+      if (length == 0) continue;
+
+      // Copy the header only once.
+      if (strncmp(line, "timestamp,", 10) == 0) {
+        if (!headerWritten) {
+          if (output.println(line) == 0) {
+            readError = true;
+            lastError = "Failed writing CSV header.";
+            break;
+          }
+          headerWritten = true;
+          Serial.println(F("CSV header written."));
+        }
+        continue;
+      }
+
+      char compact[15];
+      if (!timestampToCompact(line, compact, sizeof(compact))) {
+        Serial.println(F("Skipping invalid timestamp record."));
+        continue;
+      }
+
+      // Lexicographic comparison is valid for fixed-width YYYYMMDDHHMMSS.
+      if (strcmp(compact, startTime.c_str()) < 0) continue;
+      if (strcmp(compact, endTime.c_str())   > 0) break; // assumes time-ordered file
+
+      const size_t lineBytes = strlen(line);
+      if (output.println(line) == 0) {
+        readError = true;
+        lastError = "Failed writing CSV record.";
+        break;
+      }
+
+      ++lastRecordCount;
+      ++fileRecords;
+      lastByteCount += lineBytes + 2;
+
+      if (lastRecordCount % 100 == 0) {
+        Serial.print(F("Records retrieved: "));
+        Serial.println(lastRecordCount);
+      }
+    }
+
+    input.close();
+    Serial.print(F("Records from this file: "));
+    Serial.println(fileRecords);
+
+    if (readError) break;
+    nextMonth(year, month);
+  }
+
+  // Stage 5 — finalize
+  output.flush();
+  const bool writeOk = (bool)output;
+  output.close();
+
+  Serial.println();
+  Serial.println(F("----- RETRIEVAL SUMMARY -----"));
+  Serial.print(F("Records:          ")); Serial.println(lastRecordCount);
+  Serial.print(F("Data bytes:       ")); Serial.println(lastByteCount);
+  Serial.print(F("CSV header found: ")); Serial.println(headerWritten ? F("YES") : F("NO"));
+  Serial.print(F("Output write:     ")); Serial.println(writeOk ? F("OK") : F("FAILED"));
+
+  if (readError) {
+    SD.remove(currentOutputPath.c_str());
+    return failRetrieve(lastError);   // already set
+  }
+  if (!headerWritten) {
+    SD.remove(currentOutputPath.c_str());
+    return failRetrieve(
+        "No valid CSV header found. Expected first column header: timestamp,");
+  }
+  if (!writeOk || !SD.exists(currentOutputPath.c_str())) {
+    SD.remove(currentOutputPath.c_str());
+    return failRetrieve("Failed while writing the retrieve file.");
+  }
+
+  retrieveReady = true;
+  Serial.println(F("Retrieval completed successfully."));
+  Serial.print(F("Output file: "));
+  Serial.println(currentOutputPath);
+  Serial.println(F("=================================================="));
+  return true;
+}
+
+// =====================================================================
+// HTTP handlers
+// =====================================================================
+
+static void handleRoot() {
+  if (!LittleFS.exists("/index.html")) {
+    server.send(500, "text/plain",
+                "UI files missing. Upload the data folder to LittleFS.");
+    return;
+  }
+  File f = LittleFS.open("/index.html", FILE_READ);
+  server.streamFile(f, "text/html; charset=utf-8");
+  f.close();
+}
+
+static void handleStaticFile(const char *path, const char *contentType) {
+  if (!LittleFS.exists(path)) {
+    server.send(404, "text/plain", "File not found");
+    return;
+  }
+  File f = LittleFS.open(path, FILE_READ);
+  server.streamFile(f, contentType);
+  f.close();
+}
+
+static void handleStatus() {
+  String json = "{";
+  json += "\"sdReady\":"       + String(sdReady       ? "true" : "false") + ",";
+  json += "\"portalRunning\":true,";
+  json += "\"outputReady\":"   + String(retrieveReady ? "true" : "false") + ",";
+  json += "\"records\":"       + String(lastRecordCount) + ",";
+  json += "\"bytes\":"         + String(lastByteCount)   + ",";
+  json += jsonField("outputName", currentOutputName) + ",";
+  json += jsonField("error",      lastError);
+  json += "}";
+  sendJson(200, json);
+}
+
+static void handleRetrieve() {
+  if (!server.hasArg("start") || !server.hasArg("end")) {
+    sendJson(400, "{\"ok\":false,\"error\":\"Start and end dates are required.\"}");
+    return;
+  }
+
+  String startDate = server.arg("start");
+  String endDate   = server.arg("end");
+  if (startDate.length() != 10 || endDate.length() != 10) {
+    sendJson(400, "{\"ok\":false,\"error\":\"Invalid date format.\"}");
+    return;
+  }
+
+  // Browser sends YYYY-MM-DD. Expand to full days.
+  String startTime = startDate;  startTime.replace("-", "");  startTime += "000000";
+  String endTime   = endDate;    endTime.replace("-", "");    endTime   += "235959";
+
+  if (!retrieveRange(startTime, endTime)) {
+    sendJson(400, "{\"ok\":false,\"error\":\"" + jsonEscape(lastError) + "\"}");
+    return;
+  }
+
+  String json = "{\"ok\":true,\"records\":" + String(lastRecordCount) +
+                ",\"bytes\":"   + String(lastByteCount) +
+                ",\"filename\":\"" + jsonEscape(currentOutputName) + "\"" +
+                ",\"downloadUrl\":\"/download\"}";
+  sendJson(200, json);
+}
+
+static void handleDownload() {
+  if (!retrieveReady || currentOutputPath.length() == 0 ||
+      !SD.exists(currentOutputPath.c_str())) {
+    server.send(404, "text/plain; charset=utf-8",
+                "No retrieve file is ready. Select a date range first.");
+    return;
+  }
+
+  File file = SD.open(currentOutputPath.c_str(), FILE_READ);
+  if (!file) {
+    retrieveReady = false;
+    server.send(500, "text/plain; charset=utf-8",
+                "Could not open retrieve file.");
+    return;
+  }
+
+  server.sendHeader("Content-Disposition",
+                    "attachment; filename=\"" + currentOutputName + "\"");
+  server.sendHeader("Cache-Control", "no-store");
+  server.streamFile(file, "text/csv");
+  file.close();
+
+  // Delete only after streaming returns.
+  SD.remove(currentOutputPath.c_str());
+  retrieveReady     = false;
+  currentOutputPath = "";
+  currentOutputName = "";
+}
+
+// =====================================================================
+// Portal lifecycle
+// =====================================================================
+
+static void registerRoutes() {
+  server.on("/",           HTTP_GET, handleRoot);
+  server.on("/style.css",  HTTP_GET, []() { handleStaticFile("/style.css",  "text/css; charset=utf-8"); });
+  server.on("/script.js",  HTTP_GET, []() { handleStaticFile("/script.js",  "application/javascript; charset=utf-8"); });
+  server.on("/api/status", HTTP_GET, handleStatus);
+  server.on("/api/retrieve", HTTP_GET, handleRetrieve);
+  server.on("/download",   HTTP_GET, handleDownload);
+  server.onNotFound([]() {
+    server.sendHeader("Location", "http://192.168.4.1/", true);
+    server.send(302, "text/plain", "");
+  });
+}
+
+static void startPortal() {
+  if (portalRunning) {
+    Serial.println(F("Portal already running: http://192.168.4.1"));
+    return;
+  }
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET);
+  if (!WiFi.softAP(AP_SSID, AP_PASSWORD)) {
+    Serial.println(F("ERROR: Could not start Wi-Fi AP"));
+    return;
+  }
+
+  registerRoutes();
+  server.begin();
+  portalRunning = true;
+
+  Serial.println();
+  Serial.println(F("Wi-Fi retrieve portal started"));
+  Serial.print(F("SSID:     ")); Serial.println(AP_SSID);
+  Serial.print(F("Password: ")); Serial.println(AP_PASSWORD);
+  Serial.println(F("Open:     http://192.168.4.1"));
+}
+
+static void pollPortalButton() {
+  static int      lastButton   = HIGH;
+  static uint32_t lastEdgeMs   = 0;
+
+  const int button = digitalRead(PORTAL_BUTTON);
+  if (lastButton == HIGH && button == LOW &&
+      millis() - lastEdgeMs > BUTTON_DEBOUNCE_MS) {
+    lastEdgeMs = millis();
+    delay(25); // debounce
+    if (digitalRead(PORTAL_BUTTON) == LOW) startPortal();
+  }
+  lastButton = button;
+}
+
+// =====================================================================
+// Diagnostics
+// =====================================================================
+
+static void debugListRootFiles() {
+  Serial.println();
+  Serial.println(F("========== SD ROOT DIRECTORY =========="));
+
+  File root = SD.open("/");
+  if (!root) {
+    Serial.println(F("ERROR: Could not open SD root directory."));
+    return;
+  }
+
+  for (File entry = root.openNextFile(); entry; entry = root.openNextFile()) {
+    Serial.print(F("Name: ["));
+    Serial.print(entry.name());
+    Serial.print(F("] | Type: "));
+    Serial.print(entry.isDirectory() ? F("DIR") : F("FILE"));
+    Serial.print(F(" | Size: "));
+    Serial.println(entry.size());
+    entry.close();
+  }
+
+  root.close();
+  Serial.println(F("========== DIRECTORY LIST END =========="));
+}
+
+// =====================================================================
+// Arduino entry points
+// =====================================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(800);
+  Serial.println();
+  Serial.println(F("ESP32 SD RANGE RETRIEVE PORTAL"));
+
+  pinMode(PORTAL_BUTTON, INPUT); // External pull-up required on GPIO35
+  SPI.begin();
+
+  if (!LittleFS.begin(true)) {
+    Serial.println(F("ERROR: LittleFS initialization failed"));
+  } else {
+    Serial.println(F("LittleFS OK"));
+  }
+
+  sdReady = SD.begin(SD_CS_PIN, SPI, SD_SPI_HZ);
+  if (sdReady) {
+    Serial.println(F("SD card OK"));
+    Serial.printf("SD size: %llu MB\n",
+                  SD.cardSize() / (1024ULL * 1024ULL));
+  } else {
+    Serial.println(F("ERROR: SD initialization failed"));
+  }
+
+  debugListRootFiles();
+  Serial.println(F("Press the external button on GPIO35 to open the portal."));
+}
+
+void loop() {
+  pollPortalButton();
+  if (portalRunning) server.handleClient();
+}

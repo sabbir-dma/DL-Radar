@@ -23,6 +23,11 @@ function switchTab(name) {
         t.classList.toggle("active", t.dataset.tab === name));
     document.querySelectorAll(".tab-panel").forEach(p =>
         p.classList.toggle("active", p.id === "tab-" + name));
+
+    if (name === "data") {
+        refreshSdFiles();
+        populateSensorFilter();
+    }
 }
 
 // ---------- Load ----------
@@ -109,6 +114,7 @@ function render() {
 
     renderSensors();
     updateSensorBadge();
+    populateSensorFilter();
 }
 
 function updateSensorBadge() {
@@ -149,7 +155,7 @@ function buildSensorCard(sensor, si) {
     const channels = sensor.channels || [];
     const typeLabel = (sensor.sensor_type || 'MODBUS').toUpperCase();
 
-    // Meta pills (excluding enabled/disabled and SD log, which are now toggles)
+    // Meta pills
     const metaPills = [
         `<span class="sensor-type-badge">${typeLabel}</span>`,
         `<span class="pill pill-info">${channels.length} ch</span>`
@@ -245,6 +251,7 @@ function sensorBody(sensor, si) {
         html += channelsSection(sensor, si);
     } else if (st === 'SDI12') {
         html += sdi12Section(sensor, si, sensor.sdi12 || {});
+        html += sdi12ChannelsSection(sensor, si);
     } else {
         html += `
             <div class="group">
@@ -258,6 +265,8 @@ function sensorBody(sensor, si) {
 
     return html;
 }
+
+// ---------- MODBUS ----------
 
 function modbusSection(sensor, si, modbus) {
     const batchRead = modbus.batch_read || false;
@@ -358,6 +367,8 @@ function modbusSection(sensor, si, modbus) {
     `;
 }
 
+// ---------- SDI-12 ----------
+
 function sdi12Section(sensor, si, sdi) {
     const units = ["METER", "FOOT", "MILLIMETER", "CENTIMETER", "INCH"];
     const addrs = Array.from({length: 10}, (_, i) => String(i));  // '0'..'9'
@@ -382,7 +393,7 @@ function sdi12Section(sensor, si, sdi) {
                             `<option value="${u}" ${u === (sdi.data_unit || 'METER') ? 'selected' : ''}>${u}</option>`
                         ).join('')}
                     </select>
-                    <small class="field-help">Unit reported by the radar.</small>
+                    <small class="field-help">Unit reported by the sensor.</small>
                 </label>
                 <label class="field">
                     <span class="field-label">Warm-up (ms)</span>
@@ -403,14 +414,10 @@ function sdi12Section(sensor, si, sdi) {
                         oninput="setSensorSdi12(${si}, 'recv_timeout_ms', Number(this.value))">
                 </label>
             </div>
-        </div>
-
-        <div class="group">
-            <div class="group-title">Notes</div>
-            <div class="empty" style="padding:14px;">
-                SDI-12 returns a single measurement string; values are comma-separated
-                (e.g. <code>+12.34+0.001</code>). Readings are logged under the sensor —
-                no per-channel mapping is required.
+            <div class="empty" style="padding:14px; margin-top:12px;">
+                SDI-12 returns a comma/plus-separated measurement string
+                (e.g. <code>0+48.008+3.043+0.000014+44+16+12.2</code>).
+                Map each index to a channel below.
             </div>
         </div>
     `;
@@ -423,6 +430,113 @@ function setSensorSdi12(si, key, value) {
     setDirty(true);
     refreshSensorHeader(si);
 }
+
+// ---------- SDI-12 Channels (value-index mapping) ----------
+
+function sdi12ChannelsSection(sensor, si) {
+    const channels = sensor.channels || [];
+    const canAdd = channels.length < 12;
+
+    return `
+        <div class="channels-header">
+            <strong>SDI-12 Values (${channels.length} / 12)</strong>
+            <button onclick="addChannel(${si})" ${canAdd ? "" : "disabled"}>
+                + Add Value
+            </button>
+        </div>
+        <div id="channels-${si}">
+            ${
+                channels.length === 0
+                    ? `<div class="empty" style="padding:20px;">
+                           No values mapped. Add one to read a field from the SDI-12 response.
+                       </div>`
+                    : channels.map((c, ci) => sdiChannelHtml(sensor, si, c, ci)).join("")
+            }
+        </div>
+    `;
+}
+
+function sdiChannelHtml(sensor, si, ch, ci) {
+    const key = channelKey(sensor, si, ch, ci);
+    const isCollapsed = collapsedChannels.has(key);
+
+    const idx = (ch.value_index ?? ci);
+    const meta =
+        `idx ${idx}` +
+        ` × ${ch.scale_factor ?? 1}` +
+        (ch.offset ? ` +${ch.offset}` : '') +
+        (ch.unit ? ` [${ch.unit}]` : '');
+
+    return `
+        <div class="channel${isCollapsed ? " collapsed" : ""}" data-channel-key="${key}">
+            <div class="channel-head" onclick="toggleChannel('${key}')">
+                <div class="channel-head-left">
+                    <span class="channel-num">V${ch.id ?? ci + 1}</span>
+                    <div style="min-width:0;">
+                        <div class="channel-alias">${esc(ch.alias || "Unnamed value")}</div>
+                        <div class="channel-meta">${esc(meta)}</div>
+                    </div>
+                </div>
+                <div onclick="event.stopPropagation()">
+                    <button class="icon-btn danger"
+                        title="Delete value"
+                        onclick="deleteChannel(${si}, ${ci})">✕</button>
+                </div>
+            </div>
+
+            <div class="channel-body" ${isCollapsed ? 'style="display:none"' : ""}>
+                <div class="channel-grid">
+                    <label class="field">
+                        <span class="field-label">Channel ID</span>
+                        <input type="number" min="1"
+                            value="${ch.id ?? ci + 1}"
+                            oninput="setChannel(${si}, ${ci}, 'id', Number(this.value))">
+                    </label>
+                    <label class="field">
+                        <span class="field-label">Alias</span>
+                        <input value="${esc(ch.alias || '')}"
+                            placeholder="e.g. Distance"
+                            oninput="setChannel(${si}, ${ci}, 'alias', this.value)">
+                    </label>
+                    <label class="field">
+                        <span class="field-label">Unit</span>
+                        <input value="${esc(ch.unit || '')}"
+                            placeholder="e.g. m, °C, V"
+                            oninput="setChannel(${si}, ${ci}, 'unit', this.value)">
+                    </label>
+                    <label class="field">
+                        <span class="field-label">Value Index</span>
+                        <input type="number" min="0"
+                            value="${idx}"
+                            oninput="setChannel(${si}, ${ci}, 'value_index', Number(this.value))">
+                        <small class="field-help">Position in the SDI-12 value list (0-based).</small>
+                    </label>
+                    <label class="field">
+                        <span class="field-label">Scale Factor</span>
+                        <input type="number" step="any"
+                            value="${ch.scale_factor ?? 1}"
+                            oninput="setChannel(${si}, ${ci}, 'scale_factor', Number(this.value))">
+                    </label>
+                    <label class="field">
+                        <span class="field-label">Offset</span>
+                        <input type="number" step="any"
+                            value="${ch.offset ?? 0}"
+                            oninput="setChannel(${si}, ${ci}, 'offset', Number(this.value))">
+                        <small class="field-help">Added after scaling.</small>
+                    </label>
+                    <label class="field field-wide">
+                        <span class="field-label">Description</span>
+                        <input value="${esc(ch.description || '')}"
+                            placeholder="Optional description"
+                            oninput="setChannel(${si}, ${ci}, 'description', this.value)">
+                    </label>
+                </div>
+            </div>
+        </div>
+    `;
+}
+
+// ---------- MODBUS Channels ----------
 
 function channelsSection(sensor, si) {
     const channels = sensor.channels || [];
@@ -502,15 +616,6 @@ function channelHtml(sensor, si, ch, ci) {
                             placeholder="e.g. °C, %RH, V"
                             oninput="setChannel(${si}, ${ci}, 'unit', this.value)">
                     </label>
-                    ${ (sensor.sensor_type || 'MODBUS') !== 'MODBUS' ? `
-                    <label class="field">
-                        <span class="field-label">Value Index</span>
-                        <input type="number" min="0"
-                            value="${ch.value_index ?? ''}"
-                            oninput="setChannel(${si}, ${ci}, 'value_index', this.value === '' ? -1 : Number(this.value))">
-                        <small class="field-help">0 = first value from SDI-12 response.</small>
-                    </label>
-                    ` : '' }
                     <label class="field">
                         <span class="field-label">Register Address (hex)</span>
                         <input value="${esc(regAddr)}"
@@ -637,7 +742,6 @@ function setSensor(si, key, value) {
     config.sensors[si][key] = value;
     setDirty(true);
 
-    // Re-render whole card for structural changes
     if (key === 'sensor_type' || key === 'enabled') {
         renderSensors();
         updateSensorBadge();
@@ -704,13 +808,21 @@ function refreshChannelHeader(si, ci) {
 
     const meta = el.querySelector(".channel-meta");
     if (meta) {
-        const regAddr = ch.register_address || ch.register_number || "0x0000";
-        meta.textContent =
-            `${ch.data_type || "INT16"}` +
-            ` @ ${regAddr}` +
-            ` × ${ch.scale_factor ?? 1}` +
-            (ch.offset ? ` +${ch.offset}` : '') +
-            (ch.unit ? ` [${ch.unit}]` : '');
+        if (sensor.sensor_type === 'SDI12') {
+            meta.textContent =
+                `idx ${ch.value_index ?? ci}` +
+                ` × ${ch.scale_factor ?? 1}` +
+                (ch.offset ? ` +${ch.offset}` : '') +
+                (ch.unit ? ` [${ch.unit}]` : '');
+        } else {
+            const regAddr = ch.register_address || ch.register_number || "0x0000";
+            meta.textContent =
+                `${ch.data_type || "INT16"}` +
+                ` @ ${regAddr}` +
+                ` × ${ch.scale_factor ?? 1}` +
+                (ch.offset ? ` +${ch.offset}` : '') +
+                (ch.unit ? ` [${ch.unit}]` : '');
+        }
     }
 }
 
@@ -722,6 +834,7 @@ function addSensor() {
     const s = {
         id: nextSensorId(),
         name: "New Sensor",
+
         sensor_enable: true,
         sd_logging: false,
         poll_interval_ms: 5000,
@@ -762,20 +875,31 @@ function addChannel(si) {
         showMessage("Maximum 12 channels per sensor.");
         return;
     }
-    s.channels.push({
+
+    const isSdi = (s.sensor_type === 'SDI12');
+    const newCh = {
         id: nextChannelId(s),
-        alias: "New Channel",
+        alias: isSdi ? "New Value" : "New Channel",
         description: "",
         unit: "",
-        register_address: "0x00",
-        register_type: "HOLDING",
         scale_factor: 1,
-        offset: 0,
-        data_type: "INT16",
-        register_width: 1,
-        bit_index: -1,
-        byte_order: "BIG_ENDIAN"
-    });
+        offset: 0
+    };
+
+    if (isSdi) {
+        newCh.value_index = s.channels.length;
+    } else {
+        Object.assign(newCh, {
+            register_address: "0x00",
+            register_type: "HOLDING",
+            data_type: "INT16",
+            register_width: 1,
+            bit_index: -1,
+            byte_order: "BIG_ENDIAN"
+        });
+    }
+
+    s.channels.push(newCh);
     setDirty(true);
 
     const sensor = config.sensors[si];
@@ -834,13 +958,6 @@ function showMessage(message, success = true) {
     setTimeout(() => { msg.style.display = "none"; }, 3000);
 }
 
-function showConfirm(message) {
-    return new Promise(resolve => {
-        const ok = window.confirm(message);
-        resolve(ok);
-    });
-}
-
 function showDeleteConfirm(message) {
     return new Promise(resolve => {
         const box = document.createElement("div");
@@ -860,6 +977,234 @@ function showDeleteConfirm(message) {
         box.querySelector("#cancelDelete").onclick = () => { box.remove(); resolve(false); };
         box.querySelector("#confirmDelete").onclick = () => { box.remove(); resolve(true); };
     });
+}
+
+// ---------- Data Retrieve ----------
+
+function populateSensorFilter() {
+    const sel = $("dataSensorFilter");
+    if (!sel) return;
+    if (!sel || !config) return;
+    const current = sel.value;
+    sel.innerHTML = `<option value="">All sensors</option>` +
+        config.sensors.map(s =>
+            `<option value="${esc(s.name || '')}">${esc(s.name || `Sensor ${s.id}`)}</option>`
+        ).join("");
+    sel.value = current;
+}
+
+async function refreshSdFiles() {
+    const box = $("sdFileList");
+    if (!box) return;
+    box.innerHTML = `<span class="sd-file-chip empty-chip">Loading files…</span>`;
+
+    try {
+        const r = await fetch("/api/files");
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const data = await r.json();
+        const files = data.files || [];
+        if (files.length === 0) {
+            box.innerHTML = `<span class="sd-file-chip empty-chip">No log files on SD card</span>`;
+            return;
+        }
+        box.innerHTML = files.map(f => {
+            const name = typeof f === "string" ? f : (f.name || "");
+            const size = typeof f === "string" ? "" : formatSize(f.size);
+            return `<span class="sd-file-chip" title="Preview this file"
+                        onclick="loadFileIntoRange('${esc(name)}')"
+                        style="cursor:pointer;">
+                        📄 ${esc(name)}${size ? " · " + size : ""}
+                    </span>`;
+        }).join("");
+    } catch (e) {
+        box.innerHTML = `<span class="sd-file-chip empty-chip">Could not list files</span>`;
+    }
+}
+
+function loadFileIntoRange(name) {
+    // name looks like "202601.csv" -> set date range to that whole month
+    const m = name.match(/^(\d{4})(\d{2})/);
+    if (!m) return;
+    const y = m[1], mo = m[2];
+    $("dataFrom").value = `${y}-${mo}-01`;
+    const last = new Date(Number(y), Number(mo), 0).getDate();  // last day
+    $("dataTo").value = `${y}-${mo}-${String(last).padStart(2,'0')}`;
+    previewData();
+}
+
+function formatSize(bytes) {
+    if (!bytes || bytes < 0) return "";
+    if (bytes < 1024) return bytes + " B";
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+    return (bytes / (1024 * 1024)).toFixed(2) + " MB";
+}
+
+function getDataQuery() {
+    const from = $("dataFrom").value;
+    const to   = $("dataTo").value;
+    if (!from || !to) {
+        showMessage("Select both start and end dates.", false);
+        return null;
+    }
+    if (from > to) {
+        showMessage("Start date must be before end date.", false);
+        return null;
+    }
+    const params = new URLSearchParams();
+    params.set("from", from);
+    params.set("to", to);
+    const sensorEl = $("dataSensorFilter");
+    if (sensorEl && sensorEl.value) params.set("sensor", sensorEl.value);
+    return params;
+}
+
+async function previewData() {
+    const params = getDataQuery();
+    if (!params) return;
+    params.set("limit", "200");
+    params.set("format", "json");
+
+    const info = $("previewInfo");
+    info.textContent = "Loading…";
+
+    try {
+        const r = await fetch("/api/data?" + params.toString());
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const ct = r.headers.get("content-type") || "";
+
+        if (params.get("format") === "json" || ct.includes("json")) {
+            const data = await r.json();
+            renderPreviewTable(data.rows || [], data.headers || null);
+            info.textContent = `${(data.rows || []).length} row(s) shown`;
+        } else {
+            const text = await r.text();
+            renderPreviewCsv(text);
+            const rows = Math.max(0, text.trim().split(/\r?\n/).length - 1);
+            info.textContent = `${rows} row(s) shown`;
+        }
+    } catch (e) {
+        info.textContent = "";
+        showMessage("Preview failed: " + e.message, false);
+    }
+}
+
+function renderPreviewCsv(csvText) {
+    const lines = csvText.trim().split(/\r?\n/).filter(l => l.length);
+    if (!lines.length) {
+        renderPreviewTable([], null);
+        return;
+    }
+    const headers = lines[0].split("\t").length > 1
+        ? lines[0].split("\t")
+        : lines[0].split(",");
+    const sep = lines[0].includes("\t") ? "\t" : ",";
+    const rows = lines.slice(1).map(l => l.split(sep));
+    renderPreviewTable(rows, headers);
+}
+
+function renderPreviewTable(rows, headers) {
+    const table  = $("previewTable");
+    const thead  = table.querySelector("thead");
+    const tbody  = table.querySelector("tbody");
+
+    if (!rows.length) {
+        thead.innerHTML = "";
+        tbody.innerHTML = "";
+        table.classList.remove("has-data");
+        $("previewEmpty").style.display = "";
+        return;
+    }
+
+    if (!headers) {
+        headers = ["timestamp","device_id","AOS","LOS","csq","fwv","hwv",
+                   "heap","uptime","solar_voltage","battery_voltage",
+                   "sensor_name","raw_data"];
+    }
+
+    thead.innerHTML = `<tr>${headers.map(h => `<th>${esc(h)}</th>`).join("")}</tr>`;
+    tbody.innerHTML = rows.map(row =>
+        `<tr>${row.map(v => `<td>${esc(v)}</td>`).join("")}</tr>`
+    ).join("");
+
+    table.classList.add("has-data");
+    $("previewEmpty").style.display = "none";
+}
+
+async function downloadData() {
+    const params = getDataQuery();
+    if (!params) return;
+
+    const btns = document.querySelectorAll(".data-actions button");
+    btns.forEach(b => b.disabled = true);
+    const info = $("previewInfo");
+    info.textContent = "Preparing file on device…";
+
+    try {
+        // Step 1: device filters the range into a temp file on the SD card.
+        const r = await fetch("/api/retrieve?" + params.toString(), { cache: "no-store" });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok || !d.ok) throw new Error(d.error || ("HTTP " + r.status));
+        if (!d.records) {
+            info.textContent = "";
+            showMessage("No records found in the selected range.", false);
+            return;
+        }
+        // Step 2: browser downloads the finished file directly.
+        info.textContent = `${d.records} row(s), ${formatSize(d.bytes)} — downloading…`;
+        const a = document.createElement("a");
+        a.href = d.downloadUrl || "/api/retrieve/download";
+        a.download = d.filename || "data.csv";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        showMessage("Download started.");
+    } catch (e) {
+        info.textContent = "";
+        showMessage("Download failed: " + e.message, false);
+    } finally {
+        btns.forEach(b => b.disabled = false);
+    }
+}
+
+function downloadSingleFile(name) {
+    // Strip a leading slash if any; the server adds it back.
+    const clean = name.replace(/^\//, "");
+    const url = "/api/sd/download?file=" + encodeURIComponent(clean);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = clean.split("/").pop();
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    showMessage("Download started.");
+}
+
+async function loadSDFiles() {
+    const box = $("sdFiles");
+    const status = $("sdStatus");
+    if (!box) return;
+    box.innerHTML = `<span class="sd-file-chip empty-chip">Loading…</span>`;
+    try {
+        const r = await fetch("/api/sd/files");
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const files = await r.json();
+        if (!files.length) {
+            box.innerHTML = `<span class="sd-file-chip empty-chip">No files</span>`;
+            status.textContent = "SD card mounted — empty";
+            return;
+        }
+        status.textContent = `SD card mounted — ${files.length} file(s)`;
+        box.innerHTML = files.map(f => {
+            const n = f.name.replace(/^\//, "");
+            return `<span class="sd-file-chip">📄 ${esc(n)} · ${formatSize(f.size)}
+                <button class="icon-btn" onclick="downloadSingleFile('${esc(n)}')">⬇</button>
+                <button class="icon-btn danger" onclick="deleteSdFile('${esc(n)}')">✕</button>
+            </span>`;
+        }).join("");
+    } catch (e) {
+        box.innerHTML = `<span class="sd-file-chip empty-chip">Error: ${esc(e.message)}</span>`;
+        status.textContent = "SD card error";
+    }
 }
 
 // ---------- Save / reset ----------

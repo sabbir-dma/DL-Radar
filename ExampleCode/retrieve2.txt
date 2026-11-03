@@ -1,0 +1,380 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <SD.h>
+
+// =========================
+// Hardware
+// =========================
+#define SD_CS_PIN     5
+#define BUTTON_PIN    36
+
+// =========================
+// Retrieve range
+// YYYYMMDDHHMMSS
+// =========================
+const char START_TIME[] = "20260828032000";
+const char END_TIME[]   = "20260912042000";
+
+// =========================
+// Files
+// =========================
+const char INPUT_FILE[] =
+    "/2026_September.csv";
+
+const char OUTPUT_FILE[] =
+    "/retrieve_20260915032000_20260918042000.csv";
+
+// Large buffer for fast copying
+#define BUFFER_SIZE 4096
+
+char buffer[BUFFER_SIZE];
+
+
+// =====================================================
+// Convert CSV timestamp:
+//
+// 2026-09-15 03:20:00
+//
+// to:
+//
+// 20260915032000
+// =====================================================
+bool timestampToCompact(
+    const char *src,
+    char *dst
+) {
+    if (strlen(src) < 19)
+        return false;
+
+    // YYYY
+    dst[0]  = src[0];
+    dst[1]  = src[1];
+    dst[2]  = src[2];
+    dst[3]  = src[3];
+
+    // MM
+    dst[4]  = src[5];
+    dst[5]  = src[6];
+
+    // DD
+    dst[6]  = src[8];
+    dst[7]  = src[9];
+
+    // HH
+    dst[8]  = src[11];
+    dst[9]  = src[12];
+
+    // MM
+    dst[10] = src[14];
+    dst[11] = src[15];
+
+    // SS
+    dst[12] = src[17];
+    dst[13] = src[18];
+
+    dst[14] = '\0';
+
+    return true;
+}
+
+
+
+void retrieveFile()
+{
+    Serial.println();
+    Serial.println("==============================");
+    Serial.println("MULTI-FILE RETRIEVE START");
+    Serial.println("==============================");
+
+    unsigned long startMillis = millis();
+
+    // Output filename
+    char outputName[80];
+
+    snprintf(
+        outputName,
+        sizeof(outputName),
+        "/retrieve_%s_%s.csv",
+        START_TIME,
+        END_TIME
+    );
+
+    // Delete old retrieve file
+    if (SD.exists(outputName)) {
+        SD.remove(outputName);
+    }
+
+    File output = SD.open(
+        outputName,
+        FILE_WRITE
+    );
+
+    if (!output) {
+        Serial.println(
+            "ERROR: Cannot create output file"
+        );
+        return;
+    }
+
+    // Monthly files
+    const char *files[] = {
+        "/2026_August.csv",
+        "/2026_September.csv"
+    };
+
+    const int fileCount =
+        sizeof(files) / sizeof(files[0]);
+
+    bool headerWritten = false;
+    uint32_t records = 0;
+    uint32_t bytesCopied = 0;
+
+    char line[512];
+
+    // ---------------------------------------
+    // Process every monthly file
+    // ---------------------------------------
+    for (int f = 0; f < fileCount; f++)
+    {
+        Serial.print("Opening: ");
+        Serial.println(files[f]);
+
+        File input = SD.open(
+            files[f],
+            FILE_READ
+        );
+
+        if (!input) {
+            Serial.print(
+                "WARNING: Cannot open "
+            );
+            Serial.println(files[f]);
+
+            continue;
+        }
+
+        while (input.available())
+        {
+            size_t len =
+                input.readBytesUntil(
+                    '\n',
+                    line,
+                    sizeof(line) - 1
+                );
+
+            line[len] = '\0';
+
+            // Remove CR
+            if (
+                len > 0 &&
+                line[len - 1] == '\r'
+            ) {
+                line[len - 1] = '\0';
+            }
+
+            // --------------------------------
+            // Header
+            // --------------------------------
+            if (
+                strncmp(
+                    line,
+                    "timestamp,",
+                    10
+                ) == 0
+            )
+            {
+                if (!headerWritten)
+                {
+                    output.println(line);
+                    headerWritten = true;
+                }
+
+                continue;
+            }
+
+            // --------------------------------
+            // Validate timestamp
+            // --------------------------------
+            if (strlen(line) < 19)
+                continue;
+
+            char compactTime[15];
+
+            if (
+                !timestampToCompact(
+                    line,
+                    compactTime
+                )
+            ) {
+                continue;
+            }
+
+            // --------------------------------
+            // Before START
+            // --------------------------------
+            if (
+                strcmp(
+                    compactTime,
+                    START_TIME
+                ) < 0
+            ) {
+                continue;
+            }
+
+            // --------------------------------
+            // After END
+            // --------------------------------
+            if (
+                strcmp(
+                    compactTime,
+                    END_TIME
+                ) > 0
+            ) {
+                // Since monthly files are ordered,
+                // this file is finished.
+                break;
+            }
+
+            // --------------------------------
+            // Matching record
+            // --------------------------------
+            output.println(line);
+
+            records++;
+
+            bytesCopied +=
+                strlen(line) + 2;
+        }
+
+        input.close();
+
+        Serial.print("Finished: ");
+        Serial.println(files[f]);
+    }
+
+    output.flush();
+    output.close();
+
+    unsigned long elapsed =
+        millis() - startMillis;
+
+    Serial.println();
+    Serial.println("==============================");
+    Serial.println("RETRIEVE COMPLETE");
+    Serial.println("==============================");
+
+    Serial.print("Records : ");
+    Serial.println(records);
+
+    Serial.print("Bytes   : ");
+    Serial.println(bytesCopied);
+
+    Serial.print("Time    : ");
+    Serial.print(elapsed);
+    Serial.println(" ms");
+
+    Serial.print("Output  : ");
+    Serial.println(outputName);
+
+    Serial.println("==============================");
+}
+
+
+// =====================================================
+// Setup
+// =====================================================
+void setup()
+{
+    Serial.begin(115200);
+
+    delay(1000);
+
+    Serial.println();
+    Serial.println("ESP32 SD RETRIEVE");
+    Serial.println("------------------------------");
+
+    pinMode(
+        BUTTON_PIN,
+        INPUT_PULLUP
+    );
+
+    // Start SPI
+    SPI.begin();
+
+    if (!SD.begin(
+            SD_CS_PIN,
+            SPI,
+            20000000
+        )) {
+
+        Serial.println(
+            "ERROR: SD initialization failed"
+        );
+
+        while (1) {
+            delay(1000);
+        }
+    }
+
+    Serial.println(
+        "SD card OK"
+    );
+
+    uint64_t cardSize =
+        SD.cardSize() / (1024 * 1024);
+
+    Serial.print(
+        "SD size: "
+    );
+
+    Serial.print(cardSize);
+
+    Serial.println(
+        " MB"
+    );
+
+    Serial.println();
+    Serial.println(
+        "Press button to retrieve"
+    );
+}
+
+
+// =====================================================
+// Loop
+// =====================================================
+void loop()
+{
+    static bool lastButton = HIGH;
+
+    bool button =
+        digitalRead(BUTTON_PIN);
+
+    // Detect button press
+    if (
+        lastButton == HIGH &&
+        button == LOW
+    ) {
+
+        delay(30);
+
+        if (digitalRead(BUTTON_PIN) == LOW) {
+
+            retrieveFile();
+
+            // Wait until button released
+            while (
+                digitalRead(BUTTON_PIN) == LOW
+            ) {
+                delay(10);
+            }
+
+            Serial.println();
+            Serial.println(
+                "Ready for next retrieve"
+            );
+        }
+    }
+
+    lastButton = button;
+}

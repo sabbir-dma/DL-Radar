@@ -119,11 +119,12 @@ void setup() {
 
 void loop() {
     // FreeRTOS scheduler takes over - nothing to do here
-    vTaskDelay(pdMS_TO_TICKS(1000));
     storage_handlePeriodic();
     if (softAP_started) {
         server.handleClient();
-        delay(2);
+        vTaskDelay(pdMS_TO_TICKS(2));
+    } else {
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
