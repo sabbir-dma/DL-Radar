@@ -20,3 +20,14 @@ extern QueueHandle_t radarResultQueue;
 
 void radar_setup();
 bool measureM3(String &rawData);
+bool factoryReset();
+bool setPowerHigh();
+bool setPowerLow();
+String getPowerMode();
+bool setUnitMeters();
+bool setUnitFeets();
+String getUnit();
+bool setSamples(int n);
+String getSamples();
+bool setStageHeight(float h);
+String getStageHeight();

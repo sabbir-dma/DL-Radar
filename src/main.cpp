@@ -274,6 +274,239 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         return;
     }
 
+    if (message == "factoryReset") {
+        SerialMon.println("MQTT Command: Factory Reset received");
+        if (factoryReset()) {
+            SerialMon.println("Factory Reset successful. Restarting...");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            MQTTMessage response2 = {};     // ← zeroes retries
+            snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
+            snprintf(response2.payload, sizeof(response2.payload), "[Sensor Factory Reset successful. Device restarting...]");
+            sendLedCommand(LED_PING_ACK);
+            xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
+        } else {
+            SerialMon.println("Factory Reset failed.");
+            MQTTMessage response2 = {};     // ← zeroes retries
+            snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
+            snprintf(response2.payload, sizeof(response2.payload), "[Sensor Factory Reset failed.]");
+            sendLedCommand(LED_PING_ACK);
+            xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
+        }
+        return;
+    }
+
+    if (message == "setPowerHigh") {
+        if (setPowerHigh()) {
+            SerialMon.println("MQTT Command: Set Power High received");
+            MQTTMessage response2 = {};     // ← zeroes retries
+            snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
+            snprintf(response2.payload, sizeof(response2.payload), "['Power set to HIGH']");
+            sendLedCommand(LED_PING_ACK);
+            xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
+        } else {
+            SerialMon.println("MQTT Command: Set Power High failed");
+            MQTTMessage response2 = {};     // ← zeroes retries
+            snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
+            snprintf(response2.payload, sizeof(response2.payload), "['Failed to set power to HIGH']");
+            sendLedCommand(LED_PING_ACK);
+            xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
+        }
+        return;
+    }
+
+    if (message == "setPowerLow") {
+        if (setPowerLow()) {
+            SerialMon.println("MQTT Command: Set Power Low received");
+            MQTTMessage response2 = {};     // ← zeroes retries
+            snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
+            snprintf(response2.payload, sizeof(response2.payload), "['Power set to LOW']");
+            sendLedCommand(LED_PING_ACK);
+            xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
+        } else {
+            SerialMon.println("MQTT Command: Set Power Low failed");
+            MQTTMessage response2 = {};     // ← zeroes retries
+            snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
+            snprintf(response2.payload, sizeof(response2.payload), "['Failed to set power to LOW']");
+            sendLedCommand(LED_PING_ACK);
+            xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
+        }
+        return;
+    }
+
+    if (message == "getPowerMode") {
+        if (getPowerMode() == "H") {
+            SerialMon.println("MQTT Command: Get Power Mode received");
+            MQTTMessage response2 = {};     // ← zeroes retries
+            snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
+            snprintf(response2.payload, sizeof(response2.payload), "['Current Power Mode: HIGH']");
+            sendLedCommand(LED_PING_ACK);
+            xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
+        } else if (getPowerMode() == "L") {
+            SerialMon.println("MQTT Command: Get Power Mode received");
+            MQTTMessage response2 = {};     // ← zeroes retries
+            snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
+            snprintf(response2.payload, sizeof(response2.payload), "['Current Power Mode: LOW']");
+            sendLedCommand(LED_PING_ACK);
+            xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
+        } else {
+            SerialMon.println("MQTT Command: Get Power Mode failed");
+            MQTTMessage response2 = {};     // ← zeroes retries
+            snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
+            snprintf(response2.payload, sizeof(response2.payload), "['Failed to get power mode']");
+            sendLedCommand(LED_PING_ACK);
+            xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
+        }
+        return;
+    }
+
+    if (message == "setUnitMeters") {
+        if (setUnitMeters()) {
+            SerialMon.println("MQTT Command: Set Unit Meters received");
+            MQTTMessage response2 = {};     // ← zeroes retries
+            snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
+            snprintf(response2.payload, sizeof(response2.payload), "['Unit set to METERS']");
+            sendLedCommand(LED_PING_ACK);
+            xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
+        } else {
+            SerialMon.println("MQTT Command: Set Unit Meters failed");
+            MQTTMessage response2 = {};     // ← zeroes retries
+            snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
+            snprintf(response2.payload, sizeof(response2.payload), "['Failed to set unit to METERS']");
+            sendLedCommand(LED_PING_ACK);
+            xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
+        }
+        return;
+    }
+
+    if (message == "setUnitFeets") {
+        if (setUnitFeets()) {
+            SerialMon.println("MQTT Command: Set Unit Feets received");
+            MQTTMessage response2 = {};     // ← zeroes retries
+            snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
+            snprintf(response2.payload, sizeof(response2.payload), "['Unit set to FEETS']");
+            sendLedCommand(LED_PING_ACK);
+            xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
+        } else {
+            SerialMon.println("MQTT Command: Set Unit Feets failed");
+            MQTTMessage response2 = {};     // ← zeroes retries
+            snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
+            snprintf(response2.payload, sizeof(response2.payload), "['Failed to set unit to FEETS']");
+            sendLedCommand(LED_PING_ACK);
+            xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
+        }
+        return;
+    }
+
+    if (message == "getUnit") {
+        String unit = getUnit();
+        if (unit == "M") {
+            SerialMon.println("MQTT Command: Get Unit received");
+            MQTTMessage response2 = {};     // ← zeroes retries
+            snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
+            snprintf(response2.payload, sizeof(response2.payload), "['Current Unit: METERS']");
+            sendLedCommand(LED_PING_ACK);
+            xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
+        } else if (unit == "F") {
+            SerialMon.println("MQTT Command: Get Unit received");
+            MQTTMessage response2 = {};     // ← zeroes retries
+            snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
+            snprintf(response2.payload, sizeof(response2.payload), "['Current Unit: FEETS']");
+            sendLedCommand(LED_PING_ACK);
+            xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
+        } else {
+            SerialMon.println("MQTT Command: Get Unit failed");
+            MQTTMessage response2 = {};     // ← zeroes retries
+            snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
+            snprintf(response2.payload, sizeof(response2.payload), "['Failed to get unit']");
+            sendLedCommand(LED_PING_ACK);
+            xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
+        }
+        return;
+    }
+
+// Set Samples
+if (message.startsWith("setSamples:")) {
+    unsigned long newSamples = message.substring(11).toInt();
+
+    if (newSamples >= 1 && newSamples <= 1000) {
+        setSamples(newSamples);
+
+        MQTTMessage response = {};
+        snprintf(response.topic, sizeof(response.topic), "%s", MQTT_PUB.c_str());
+        snprintf(response.payload, sizeof(response.payload),
+                 "['Successfully set samples: %lu']", newSamples);
+
+        sendLedCommand(LED_PING_ACK);
+        xQueueSend(mqttPublishQueue, &response, pdMS_TO_TICKS(100));
+    } else {
+        MQTTMessage response = {};
+        snprintf(response.topic, sizeof(response.topic), "%s", MQTT_PUB.c_str());
+        snprintf(response.payload, sizeof(response.payload),
+                 "['Samples limit exceeded (1-1000)']");
+
+        sendLedCommand(LED_PING_ACK);
+        xQueueSend(mqttPublishQueue, &response, pdMS_TO_TICKS(100));
+    }
+    return;
+}
+
+
+// Get Samples
+if (message == "getSamples") {
+    String samplesStr = getSamples();
+    MQTTMessage response = {};
+    snprintf(response.topic, sizeof(response.topic), "%s", MQTT_PUB.c_str());
+    snprintf(response.payload, sizeof(response.payload), "['Current Samples: %s']", samplesStr.c_str());
+    sendLedCommand(LED_PING_ACK);
+    xQueueSend(mqttPublishQueue, &response, pdMS_TO_TICKS(100));
+    return;
+}
+
+
+// Set Stage Height
+if (message.startsWith("setStageHeight:")) {
+    float newStageHeight = message.substring(15).toFloat();
+
+    if (newStageHeight >= 1.0 && newStageHeight <= 1000.0) {
+        setStageHeight(newStageHeight);
+
+        MQTTMessage response = {};
+
+        snprintf(response.topic, sizeof(response.topic), "%s", MQTT_PUB.c_str());
+        snprintf(response.payload, sizeof(response.payload),
+                 "['Successfully set stage height: %.2f']", getStageHeight());
+
+        sendLedCommand(LED_PING_ACK);
+        xQueueSend(mqttPublishQueue, &response, pdMS_TO_TICKS(100));
+    }
+    else {
+        MQTTMessage response = {};
+
+        snprintf(response.topic, sizeof(response.topic), "%s", MQTT_PUB.c_str());
+        snprintf(response.payload, sizeof(response.payload),
+                 "['Stage height limit exceeded (1-1000)']");
+
+        sendLedCommand(LED_PING_ACK);
+        xQueueSend(mqttPublishQueue, &response, pdMS_TO_TICKS(100));
+    }
+    return;
+}
+
+
+// Get Stage Height
+if (message == "getStageHeight") {
+    MQTTMessage response = {};
+
+    snprintf(response.topic, sizeof(response.topic), "%s", MQTT_PUB.c_str());
+    snprintf(response.payload, sizeof(response.payload),
+             "['Current Stage Height: %.2f']", getStageHeight());
+
+    sendLedCommand(LED_PING_ACK);
+    xQueueSend(mqttPublishQueue, &response, pdMS_TO_TICKS(100));
+
+    return;
+}
+
     if (message == "restart") {
         Serial.println("Esp Restarting ...");
         vTaskDelay(pdMS_TO_TICKS(1000));
