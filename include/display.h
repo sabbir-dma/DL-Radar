@@ -35,15 +35,14 @@ enum DisplayCommandType {
 };
 
 struct DisplayData {
-    float airPressure;
-    float airTemperature;
-    float airHumidity;
-    float windSpeed;
-    float windDirection;   // DO
-    float rainFall;
+    float distance;          // m/ft, calculated from radar reading (NAN = no data)
+    float stage;             // stage height read from sensor (NAN = unknown)
+    float batteryVoltage;    // V
+    float solarVoltage;      // V
     int   signalLevel;       // 0..5
     const char* statusText;
-    int   batteryPercent;    // 0..100   ✅ <-- added
+    int   batteryPercent;    // 0..100 (header icon)
+    int   otaPercent;        // -1 = no OTA running, else 0..100
 };
 
 extern Adafruit_SSD1306 display;
@@ -56,16 +55,13 @@ void sendDisplayCommand(DisplayCommandType type);
 void displayTask(void* parameter);
 
 // Update functions
-void updateAirPressure(float value);
-void updateAirTemperature(float value);
 void updateBatteryPercentage(int percent);
-void updateAirHumidity(float value);
-void updateWindSpeed(float value);
-void updateWindDirection(float value);
-void updateRainFall(float value);
 void updateSignalStrength(int level);
 void updateStatus(const char* status);
-void updateAllDisplayValues(float pressure, float temperature, float humidity, float w_speed, float w_direction, float rainfall, int signal, const char* status);
+void updateDistance(float value);        // NAN shows "---"
+void updateStageHeight(float value);     // redraws only when the value changed
+void updateVoltages(float battery, float solar);
+void updateOtaProgress(int percent);     // -1 = back to home screen
 void displaySleep();
 void displayWake();
 void displaySetBrightness(uint8_t brightness);

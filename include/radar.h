@@ -31,3 +31,11 @@ bool setSamples(int n);
 String getSamples();
 bool setStageHeight(float h);
 String getStageHeight();
+
+// Index (0-based, after the address char) of the distance value in the M3/D0 reply.
+#define RADAR_DISTANCE_FIELD 0
+#define RADAR_MAX_VALUES     8
+
+int   radarParseValues(const String &raw, float *out, int maxn);
+float radarStageHeight();            // NAN until read from the sensor
+bool  radarRefreshStageHeight();

@@ -1,4 +1,6 @@
 #include "main.h"
+#include <stdarg.h>
+#include <math.h>
 
 #include "config_portal.h"
 #include "display.h"
@@ -11,6 +13,7 @@ Preferences preferences;
 
 unsigned long HEARTBEAT_INTERVAL;
 unsigned long DATA_INTERVAL;
+volatile uint8_t dataFormat = FMT_JSON;
 
 // ==================== Setup ====================
 void setup() {
@@ -63,6 +66,11 @@ void setup() {
         
         preferences.end();
     #endif
+
+    preferences.begin("device", true);
+    dataFormat = preferences.getUChar("dfmt", FMT_JSON) == FMT_LEGACY ? FMT_LEGACY : FMT_JSON;
+    preferences.end();
+    SerialMon.printf("Data format: %s\n", dataFormat == FMT_LEGACY ? "legacy" : "json");
 
     SerialMon.println("Final Device ID: " + DEVICE_ID);
     SerialMon.println("=================================\n");
@@ -134,6 +142,8 @@ void mainTask(void* parameter) {
     unsigned long lastDataTime = 0;  // Added to track sensor data interval
     
     SerialMon.println("Main Task started");
+    updateVoltages(storage_getBatteryVoltage(), storage_getSolarVoltage());
+    updateBatteryPercentage(100);  // Initialize battery percentage to 100% at startup
     
     while (1) {
         if (otaInProgress) {
@@ -163,6 +173,8 @@ void mainTask(void* parameter) {
                 readAllSensorsAndPublish();
                 Serial.println("[MAIN] Radar read done");
                 Serial.flush();
+                updateVoltages(storage_getBatteryVoltage(), storage_getSolarVoltage());
+                updateBatteryPercentage((int)((storage_getBatteryVoltage() / 7.4) * 100)); // Assuming 4.2V is full battery
 
                 SerialMon.println("Sensor data published");
                 sendLedCommand(LED_RF_HB);
@@ -239,6 +251,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
             sendLedCommand(LED_PING_ACK);
             xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
         }
+        return;
     }
 
     if (message.startsWith("set_pub_interval:")) {
@@ -266,6 +279,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
             sendLedCommand(LED_PING_ACK);
             xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
         }
+        return;
     }
 
     if (message == "ping") {
@@ -424,88 +438,83 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         return;
     }
 
-// Set Samples
-if (message.startsWith("setSamples:")) {
-    unsigned long newSamples = message.substring(11).toInt();
-
-    if (newSamples >= 1 && newSamples <= 1000) {
-        setSamples(newSamples);
-
-        MQTTMessage response = {};
-        snprintf(response.topic, sizeof(response.topic), "%s", MQTT_PUB.c_str());
-        snprintf(response.payload, sizeof(response.payload),
-                 "['Successfully set samples: %lu']", newSamples);
-
+    // ---- helper: queue a text reply on the publish topic ----
+    auto reply = [](const char *fmt, ...) {
+        MQTTMessage r = {};
+        snprintf(r.topic, sizeof(r.topic), "%s", MQTT_PUB.c_str());
+        va_list ap; va_start(ap, fmt);
+        vsnprintf(r.payload, sizeof(r.payload), fmt, ap);
+        va_end(ap);
         sendLedCommand(LED_PING_ACK);
-        xQueueSend(mqttPublishQueue, &response, pdMS_TO_TICKS(100));
-    } else {
-        MQTTMessage response = {};
-        snprintf(response.topic, sizeof(response.topic), "%s", MQTT_PUB.c_str());
-        snprintf(response.payload, sizeof(response.payload),
-                 "['Samples limit exceeded (1-1000)']");
+        xQueueSend(mqttPublishQueue, &r, pdMS_TO_TICKS(100));
+    };
 
-        sendLedCommand(LED_PING_ACK);
-        xQueueSend(mqttPublishQueue, &response, pdMS_TO_TICKS(100));
+    // Data format:  set_data_format:json | set_data_format:legacy | get_data_format
+    {
+        String lower = message;
+        lower.toLowerCase();
+        if (lower.startsWith("set_data_format:")) {
+            String v = lower.substring(16);
+            uint8_t f;
+            if      (v == "json")   f = FMT_JSON;
+            else if (v == "legacy") f = FMT_LEGACY;
+            else { reply("['Invalid format (json|legacy)']"); return; }
+            preferences.begin("device", false);
+            preferences.putUChar("dfmt", f);
+            preferences.end();
+            dataFormat = f;
+            reply("['Data format set: %s']", f == FMT_LEGACY ? "legacy" : "json");
+            return;
+        }
+        if (lower == "get_data_format") {
+            reply("['Data format: %s']", dataFormat == FMT_LEGACY ? "legacy" : "json");
+            return;
+        }
     }
-    return;
-}
 
-
-// Get Samples
-if (message == "getSamples") {
-    String samplesStr = getSamples();
-    MQTTMessage response = {};
-    snprintf(response.topic, sizeof(response.topic), "%s", MQTT_PUB.c_str());
-    snprintf(response.payload, sizeof(response.payload), "['Current Samples: %s']", samplesStr.c_str());
-    sendLedCommand(LED_PING_ACK);
-    xQueueSend(mqttPublishQueue, &response, pdMS_TO_TICKS(100));
-    return;
-}
-
-
-// Set Stage Height
-if (message.startsWith("setStageHeight:")) {
-    float newStageHeight = message.substring(15).toFloat();
-
-    if (newStageHeight >= 1.0 && newStageHeight <= 1000.0) {
-        setStageHeight(newStageHeight);
-
-        MQTTMessage response = {};
-
-        snprintf(response.topic, sizeof(response.topic), "%s", MQTT_PUB.c_str());
-        snprintf(response.payload, sizeof(response.payload),
-                 "['Successfully set stage height: %.2f']", getStageHeight());
-
-        sendLedCommand(LED_PING_ACK);
-        xQueueSend(mqttPublishQueue, &response, pdMS_TO_TICKS(100));
+    // Set Samples:  setSamples:<1-1000>
+    if (message.startsWith("setSamples:")) {
+        long n = message.substring(11).toInt();
+        if (n < 1 || n > 1000) {
+            reply("['Samples limit exceeded (1-1000)']");
+        } else if (setSamples((int)n)) {
+            reply("['Successfully set samples: %ld','Sensor: %s']", n, getSamples().c_str());
+        } else {
+            reply("['Failed to set samples']");
+        }
+        return;
     }
-    else {
-        MQTTMessage response = {};
 
-        snprintf(response.topic, sizeof(response.topic), "%s", MQTT_PUB.c_str());
-        snprintf(response.payload, sizeof(response.payload),
-                 "['Stage height limit exceeded (1-1000)']");
-
-        sendLedCommand(LED_PING_ACK);
-        xQueueSend(mqttPublishQueue, &response, pdMS_TO_TICKS(100));
+    // Get Samples
+    if (message == "getSamples") {
+        String v = getSamples();
+        if (v.length() && v.charAt(0) == SENSOR_ADDR) reply("['Current Samples: %s']", v.c_str());
+        else                                          reply("['Failed to get samples']");
+        return;
     }
-    return;
-}
 
+    // Set Stage Height:  setStageHeight:<1-1000>
+    if (message.startsWith("setStageHeight:")) {
+        float h = message.substring(15).toFloat();
+        if (h < 1.0f || h > 1000.0f) {
+            reply("['Stage height limit exceeded (1-1000)']");
+        } else if (setStageHeight(h)) {
+            // setStageHeight() already read the value back from the sensor
+            reply("['Successfully set stage height: %.2f']", radarStageHeight());
+        } else {
+            reply("['Failed to set stage height']");
+        }
+        return;
+    }
 
-// Get Stage Height
-if (message == "getStageHeight") {
-    MQTTMessage response = {};
-
-    snprintf(response.topic, sizeof(response.topic), "%s", MQTT_PUB.c_str());
-    snprintf(response.payload, sizeof(response.payload),
-             "['Current Stage Height: %.2f']", getStageHeight());
-
-    sendLedCommand(LED_PING_ACK);
-    xQueueSend(mqttPublishQueue, &response, pdMS_TO_TICKS(100));
-
-    return;
-}
+    // Get Stage Height
+    if (message == "getStageHeight") {
+        if (radarRefreshStageHeight() && !isnan(radarStageHeight()))
+            reply("['Current Stage Height: %.2f']", radarStageHeight());
+        else
+            reply("['Failed to get stage height']");
+        return;
+    }
 
     if (message == "restart") {
         Serial.println("Esp Restarting ...");
@@ -527,6 +536,7 @@ if (message == "getStageHeight") {
 
     if (message == "wifi_ap") {
         dev_config();
+        return;
     }
 
     if (message == "get_sim_info") {
@@ -579,7 +589,11 @@ if (message == "getStageHeight") {
 
     if (message.startsWith("ota")) {
         SerialMon.println("MQTT Command: OTA update received");
-        firmwareUrl = defaultFirmwareUrl;
+        // Spaces were stripped above, so "ota http://x/y.bin" arrives as "otahttp://x/y.bin"
+        String rest = message.substring(3);
+        if (rest.startsWith("http://") || rest.startsWith("https://")) firmwareUrl = rest;
+        else                                                          firmwareUrl = defaultFirmwareUrl;
+        SerialMon.println("OTA URL: " + firmwareUrl);
 
         // MQTTMessage response;
         MQTTMessage response = {};     // ← zeroes retries
@@ -669,6 +683,7 @@ void publishHeartbeat() {
 
     //Update Display Sigal Strength
     updateSignalStrength(signalLevel);
+    updateVoltages(battV, solarV);
 
     // MQTTMessage hbMsg;
     MQTTMessage hbMsg = {};     // ← zeroes retries
@@ -791,7 +806,7 @@ bool performOTAUpdate() {
     SerialMon.printf("[OTA] Host: %s\n", host.c_str());
     SerialMon.printf("[OTA] Path: %s\n", path.c_str());
 
-    TinyGsmClient otaClient(modem);
+    TinyGsmClient otaClient(modem, 1);   // mux 1: socket 0 is held by the MQTT client
     unsigned long otaStartTime = millis();
     const unsigned long OTA_TOTAL_TIMEOUT = 300000;
 
@@ -860,6 +875,8 @@ bool performOTAUpdate() {
     size_t totalWritten = 0;
     unsigned long lastDataTime = millis();
     unsigned long lastProgressTime = millis();
+    int lastPct = -1;
+    updateOtaProgress(0);
     const unsigned long DATA_TIMEOUT = 60000;
     const unsigned long PROGRESS_INTERVAL = 1000;
 
@@ -888,10 +905,18 @@ bool performOTAUpdate() {
                         return false;
                     }
                     totalWritten += bytesRead;
-                    if (millis() - lastProgressTime > PROGRESS_INTERVAL) {
-                        float percent = (100.0 * totalWritten) / contentLength;
-                        SerialMon.printf("[OTA] Progress: %.1f%% (%d/%d bytes)\n",
-                                         percent, totalWritten, contentLength);
+                    int pct = (int)((100ULL * totalWritten) / contentLength);
+                    if (pct != lastPct) {
+                        lastPct = pct;
+                        updateOtaProgress(pct);
+                    }
+                    if (millis() - lastProgressTime > PROGRESS_INTERVAL || pct == 100) {
+                        char bar[21];
+                        int filled = pct / 5;
+                        for (int i = 0; i < 20; i++) bar[i] = i < filled ? '#' : '-';
+                        bar[20] = 0;
+                        SerialMon.printf("[OTA] [%s] %3d%% (%u/%d bytes)\n",
+                                         bar, pct, (unsigned)totalWritten, contentLength);
                         lastProgressTime = millis();
                     }
                 }

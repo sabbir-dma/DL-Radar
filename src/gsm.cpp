@@ -541,6 +541,8 @@ void otaTask(void* parameter) {
         }
     }
 
+    if (!otaOk) updateOtaProgress(-1);     // failed: leave the OTA screen
+
     if (otaOk) {
         Serial.println("[OTA] Success, rebooting");
         delay(1500);

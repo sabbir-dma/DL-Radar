@@ -14,11 +14,11 @@
 #define OTA_DATE "261020"
 //-------------------------------------------------------//
 
-#define OTA 0  // Set to 1 for OTA mode, 0 for normal mode
+#define OTA 1  // Set to 1 for OTA mode, 0 for normal mode
 #define WORK_PACKAGE             "1292"
 #define DEVICE_TYPE              "03"
 #define DEVICE_CODE_UPLOAD_DATE  "261011"
-#define DEVICE_SERIAL_ID         "0002"
+#define DEVICE_SERIAL_ID         "0099"
 
 #define UNIQUE_DEVICE_ID WORK_PACKAGE DEVICE_TYPE DEVICE_CODE_UPLOAD_DATE DEVICE_SERIAL_ID
 //=========================================================================================//
@@ -81,6 +81,12 @@ struct MQTTMessage {
     uint8_t retries;
     bool    sd_log;      // <-- add this
 };
+
+// ---- Publish data format (persisted in NVS: namespace "device", key "dfmt") ----
+// FMT_JSON   : {"ts":...,"data":[{"alias":...}]}           (current format)
+// FMT_LEGACY : <device_id>,<raw sdi12>+<battery V>+<solar V>+<YYMMDDHHMMSS>
+enum DataFormat : uint8_t { FMT_JSON = 0, FMT_LEGACY = 1 };
+extern volatile uint8_t dataFormat;
 
 // Helper function prototype
 String getMACDeviceID();

@@ -24,6 +24,7 @@ function switchTab(name) {
     document.querySelectorAll(".tab-panel").forEach(p =>
         p.classList.toggle("active", p.id === "tab-" + name));
 
+    if (name === "sensors") loadStage();
     if (name === "data") {
         refreshSdFiles();
         populateSensorFilter();
@@ -437,23 +438,23 @@ function sdi12ChannelsSection(sensor, si) {
     const channels = sensor.channels || [];
     const canAdd = channels.length < 12;
 
-    return `
-        <div class="channels-header">
-            <strong>SDI-12 Values (${channels.length} / 12)</strong>
-            <button onclick="addChannel(${si})" ${canAdd ? "" : "disabled"}>
-                + Add Value
-            </button>
-        </div>
-        <div id="channels-${si}">
-            ${
-                channels.length === 0
-                    ? `<div class="empty" style="padding:20px;">
-                           No values mapped. Add one to read a field from the SDI-12 response.
-                       </div>`
-                    : channels.map((c, ci) => sdiChannelHtml(sensor, si, c, ci)).join("")
-            }
-        </div>
-    `;
+    // return `
+    //     <div class="channels-header">
+    //         <strong>SDI-12 Values (${channels.length} / 12)</strong>
+    //         <button onclick="addChannel(${si})" ${canAdd ? "" : "disabled"}>
+    //             + Add Value
+    //         </button>
+    //     </div>
+    //     <div id="channels-${si}">
+    //         ${
+    //             channels.length === 0
+    //                 ? `<div class="empty" style="padding:20px;">
+    //                        No values mapped. Add one to read a field from the SDI-12 response.
+    //                    </div>`
+    //                 : channels.map((c, ci) => sdiChannelHtml(sensor, si, c, ci)).join("")
+    //         }
+    //     </div>
+    // `;
 }
 
 function sdiChannelHtml(sensor, si, ch, ci) {
@@ -1270,3 +1271,44 @@ function esc(v) {
 }
 
 loadConfig();
+
+// ---------- Radar stage height ----------
+
+async function loadStage() {
+    const el = $("stageHeight");
+    if (!el) return;
+    try {
+        const r = await fetch("/api/stage", { cache: "no-store" });
+        const d = await r.json();
+        if (r.ok && d.ok && typeof d.stage === "number") el.value = d.stage;
+        else showMessage(d.message || "Could not read stage height", false);
+    } catch (e) {
+        showMessage("Could not read stage height: " + e.message, false);
+    }
+}
+
+async function saveStage() {
+    const el = $("stageHeight");
+    const v = parseFloat(el.value);
+    if (!isFinite(v) || v < 1 || v > 1000) {
+        showMessage("Stage height must be between 1 and 1000.", false);
+        return;
+    }
+    const btn = $("stageSaveBtn");
+    btn.disabled = true;
+    try {
+        const r = await fetch("/api/stage", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ stage: v })
+        });
+        const d = await r.json();
+        if (!r.ok || !d.ok) throw new Error(d.message || ("HTTP " + r.status));
+        el.value = d.stage;
+        showMessage("Stage height set to " + d.stage);
+    } catch (e) {
+        showMessage("Failed: " + e.message, false);
+    } finally {
+        btn.disabled = false;
+    }
+}

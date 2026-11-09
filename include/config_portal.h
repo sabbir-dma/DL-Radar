@@ -5,6 +5,7 @@
 #include <ArduinoJson.h>
 #include <SD.h>
 #include "storage.h"
+#include "radar.h"
 
 #define AP_SSID     "DL301-26"
 #define AP_PASSWORD "12345678"
@@ -495,6 +496,41 @@ void handleRetrieveDownload() {
 }
 
 
+
+// ---------- Stage height (stored in the radar sensor) ----------
+
+void handleGetStage() {
+    JsonDocument doc;
+    bool ok = radarRefreshStageHeight();
+    float v = radarStageHeight();
+    doc["ok"] = ok;
+    if (!isnan(v)) doc["stage"] = v;
+    else           doc["message"] = "Could not read stage height from sensor";
+    sendJson(ok ? 200 : 503, doc);
+}
+
+void handleSetStage() {
+    JsonDocument in;
+    if (deserializeJson(in, server.arg("plain")) || !in["stage"].is<float>()) {
+        sendMessage(400, false, "Invalid request");
+        return;
+    }
+    float h = in["stage"].as<float>();
+    if (h < 1.0f || h > 1000.0f) {
+        sendMessage(400, false, "Stage height must be 1 - 1000");
+        return;
+    }
+    if (!setStageHeight(h)) {
+        sendMessage(502, false, "Sensor did not accept the stage height");
+        return;
+    }
+    JsonDocument doc;
+    doc["ok"] = true;
+    doc["message"] = "Stage height updated";
+    doc["stage"] = radarStageHeight();      // value read back from the sensor
+    sendJson(200, doc);
+}
+
 void handleNotFound()
 {
     server.send(404, "text/plain", "Not found");
@@ -620,6 +656,8 @@ void setupWebServer()
     server.on("/api/config",       HTTP_GET,  handleGetConfig);
     server.on("/api/config",       HTTP_POST, handleSetConfig);
     server.on("/api/config/reset", HTTP_POST, handleResetConfig);
+    server.on("/api/stage",        HTTP_GET,  handleGetStage);
+    server.on("/api/stage",        HTTP_POST, handleSetStage);
     server.on("/api/files",        HTTP_GET,  handleFiles);
     server.on("/api/data",         HTTP_GET,  handleData);
     server.on("/api/retrieve",          HTTP_GET, handleRetrieve);

@@ -507,55 +507,10 @@ bool readModbusSensor(JsonObject sensor, ChannelWriter &w) {
             );
 
             appendChannel(w, alias, value, unit);
-
-            // Update the matching display field.
-            if (strcmp(alias, "pressure") == 0) {
-                updateAirPressure(value);
-            }
-            else if (strcmp(alias, "temperature") == 0) {
-                updateAirTemperature(value);
-            }
-            // else if (strcmp(alias, "batteryPercentage") == 0) {
-            //     updateBatteryPercentage((int)(value + 0.5f));
-            // }
-            else if (strcmp(alias, "humidity") == 0) {
-                updateAirHumidity(value);
-            }
-            else if (strcmp(alias, "wind_speed") == 0) {
-                updateWindSpeed(value);
-            }
-            else if (strcmp(alias, "wind_direction") == 0) {
-                updateWindDirection(value);
-            }
-            else if (strcmp(alias, "rain_fall") == 0) {
-                updateRainFall(value);
-            }
         }
         else {
             Serial.printf("%-22s : ERROR\n", alias);
             appendChannelError(w, alias, unit);
-
-            if (strcmp(alias, "pressure") == 0) {
-                updateAirPressure(NAN);
-            }
-            else if (strcmp(alias, "temperature") == 0) {
-                updateAirTemperature(NAN);
-            }
-            // else if (strcmp(alias, "batteryPercentage") == 0) {
-            //     updateBatteryPercentage(-1);
-            // }
-            else if (strcmp(alias, "humidity") == 0) {
-                updateAirHumidity(NAN);
-            }
-            else if (strcmp(alias, "wind_speed") == 0) {
-                updateWindSpeed(NAN);
-            }
-            else if (strcmp(alias, "wind_direction") == 0) {
-                updateWindDirection(NAN);
-            }
-            else if (strcmp(alias, "rain_fall") == 0) {
-                updateRainFall(NAN);
-            }
         }
     }
 

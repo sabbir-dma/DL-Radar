@@ -2,6 +2,7 @@
 // display.cpp
 #include "display.h"
 #include <Arduino.h>
+#include <math.h>
 
 #include "main.h"
 
@@ -25,15 +26,14 @@ Adafruit_SSD1306 display(
 );
 
 DisplayData displayData = {
-    NAN,      // airPressure
-    NAN,      // airTemperature
-    NAN,      // airHumidity
-    NAN,      // windSpeed
-    NAN,      // windDirection
-    NAN,      // rainFall
+    NAN,      // distance
+    NAN,      // stage
+    NAN,      // batteryVoltage
+    NAN,      // solarVoltage
     0,        // signalLevel
     "OFFLINE",// statusText
-    75        // batteryPercent (new)
+    75,       // batteryPercent
+    -1        // otaPercent (-1 = no OTA running)
 };
 
 TaskHandle_t displayTaskHandle = NULL;
@@ -186,7 +186,30 @@ static void displayWelcomeScreen() {
     delay(5000);
 }
 
+static void displayOtaPage() {
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(22, 4);
+    display.print("FIRMWARE UPDATE");
+
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%d%%", displayData.otaPercent);
+    display.setTextSize(3);
+    int16_t x1, y1; uint16_t w, h;
+    display.getTextBounds(buf, 0, 0, &x1, &y1, &w, &h);
+    display.setCursor((SCREEN_WIDTH - w) / 2, 20);
+    display.print(buf);
+
+    const int barX = 8, barY = 50, barW = 112, barH = 10;
+    display.drawRect(barX, barY, barW, barH, SSD1306_WHITE);
+    int fill = ((barW - 4) * displayData.otaPercent) / 100;
+    if (fill > 0) display.fillRect(barX + 2, barY + 2, fill, barH - 4, SSD1306_WHITE);
+    display.display();
+}
+
 static void displayHomePage() {
+    if (displayData.otaPercent >= 0) { displayOtaPage(); return; }
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
     display.setTextSize(1);
@@ -201,7 +224,7 @@ static void displayHomePage() {
     drawBatteryIcon(displayData.batteryPercent);
     drawSignalBars(displayData.signalLevel);
 
-    const char* title = "DMA_AWS";
+    const char* title = "DMA_AWLG";
 
     int16_t x1, y1;
     uint16_t w, h;
@@ -223,54 +246,41 @@ static void displayHomePage() {
     // Status separator
     display.drawLine(LEFT, 23, RIGHT, 23, SSD1306_WHITE);
 
-    // =========================================================
-    // TEMPERATURE | WIND SPEED
-    // =========================================================
-    char buffer[20];
+    char buffer[28];
 
-    snprintf(buffer, sizeof(buffer), "Tmp:%.2f", displayData.airTemperature);
+    // =========================================================
+    // DISTANCE (calculated from radar reading)
+    // =========================================================
+    if (isnan(displayData.distance)) snprintf(buffer, sizeof(buffer), "Dist : ---");
+    else                             snprintf(buffer, sizeof(buffer), "Dist : %.3f", displayData.distance);
     display.setCursor(LEFT, 26);
     display.print(buffer);
 
-    snprintf(buffer, sizeof(buffer), "Wsp:%.1f", displayData.windSpeed);
-    display.setCursor(67, 26);
-    display.print(buffer);
-
-    // Middle vertical divider
-    display.drawLine(DIV, 24, DIV, 34, SSD1306_WHITE);
-
-    // Horizontal separator
     display.drawLine(LEFT, 35, RIGHT, 35, SSD1306_WHITE);
 
     // =========================================================
-    // HUMIDITY | WIND DIRECTION
+    // STAGE (read from sensor once, and again when it changes)
     // =========================================================
-    snprintf(buffer, sizeof(buffer), "Hum:%.2f", displayData.airHumidity);
+    if (isnan(displayData.stage)) snprintf(buffer, sizeof(buffer), "Stage: ---");
+    else                          snprintf(buffer, sizeof(buffer), "Stage: %.2f", displayData.stage);
     display.setCursor(LEFT, 38);
     display.print(buffer);
 
-    snprintf(buffer, sizeof(buffer), "Wdr:%.1f", displayData.windDirection);
-    display.setCursor(67, 38);
-    display.print(buffer);
-
-    // Middle vertical divider
-    display.drawLine(DIV, 36, DIV, 46, SSD1306_WHITE);
-
-    // Horizontal separator
     display.drawLine(LEFT, 47, RIGHT, 47, SSD1306_WHITE);
 
     // =========================================================
-    // PRESSURE | RAIN FALL
+    // BATTERY | SOLAR VOLTAGE
     // =========================================================
-    snprintf(buffer, sizeof(buffer), "Prs:%.0f", displayData.airPressure);
+    if (isnan(displayData.batteryVoltage)) snprintf(buffer, sizeof(buffer), "Bat:--");
+    else                                   snprintf(buffer, sizeof(buffer), "Bat:%.1fV", displayData.batteryVoltage);
     display.setCursor(LEFT, 50);
     display.print(buffer);
 
-    snprintf(buffer, sizeof(buffer), "Rn:%.1f", displayData.rainFall);
+    if (isnan(displayData.solarVoltage)) snprintf(buffer, sizeof(buffer), "Sol:--");
+    else                                 snprintf(buffer, sizeof(buffer), "Sol:%.1fV", displayData.solarVoltage);
     display.setCursor(67, 50);
     display.print(buffer);
 
-    // Middle vertical divider
     display.drawLine(DIV, 48, DIV, 60, SSD1306_WHITE);
 
     // Bottom separator
@@ -324,40 +334,10 @@ void sendDisplayCommand(DisplayCommandType type) {
     xQueueSend(displayCommandQueue, &type, pdMS_TO_TICKS(10));
 }
 
-void updateAirPressure(float value) {
-    displayData.airPressure = value;
-    sendDisplayCommand(DISPLAY_UPDATE_HOME);
-}
-
-void updateAirTemperature(float value) {
-    displayData.airTemperature = value;
-    sendDisplayCommand(DISPLAY_UPDATE_HOME);
-}
-
 void updateBatteryPercentage(int percent) {
     if (percent < 0) percent = 0;
     if (percent > 100) percent = 100;
     displayData.batteryPercent = percent;
-    sendDisplayCommand(DISPLAY_UPDATE_HOME);
-}
-
-void updateAirHumidity(float value) {
-    displayData.airHumidity = value;
-    sendDisplayCommand(DISPLAY_UPDATE_HOME);
-}
-
-void updateWindSpeed(float value) {
-    displayData.windSpeed = value;
-    sendDisplayCommand(DISPLAY_UPDATE_HOME);
-}
-
-void updateWindDirection(float value) {
-    displayData.windDirection = value;
-    sendDisplayCommand(DISPLAY_UPDATE_HOME);
-}
-
-void updateRainFall(float value) {
-    displayData.rainFall = value;
     sendDisplayCommand(DISPLAY_UPDATE_HOME);
 }
 
@@ -373,20 +353,33 @@ void updateStatus(const char* status) {
     sendDisplayCommand(DISPLAY_UPDATE_HOME);
 }
 
-void updateAllDisplayValues(float pressure, float temperature, float humidity, float w_speed, float w_direction, float rainfall, int signal, const char* status) {
+void updateDistance(float value) {
+    displayData.distance = value;
+    sendDisplayCommand(DISPLAY_UPDATE_HOME);
+}
 
-    displayData.airPressure = pressure;
-    displayData.airTemperature = temperature;
-    displayData.airHumidity = humidity;
-    displayData.windSpeed = w_speed;
-    displayData.windDirection = w_direction;
-    displayData.rainFall = rainfall;
+void updateStageHeight(float value) {
+    // Stage is read from the sensor rarely; only redraw when it really changed.
+    bool same = (isnan(value) && isnan(displayData.stage)) ||
+                (!isnan(value) && !isnan(displayData.stage) &&
+                 fabsf(value - displayData.stage) < 0.0005f);
+    if (same) return;
+    displayData.stage = value;
+    sendDisplayCommand(DISPLAY_UPDATE_HOME);
+}
 
-    if (signal < 0) signal = 0;
-    if (signal > 5) signal = 5;
-    displayData.signalLevel = signal;
+void updateVoltages(float battery, float solar) {
+    displayData.batteryVoltage = battery;
+    displayData.solarVoltage   = solar;
+    sendDisplayCommand(DISPLAY_UPDATE_HOME);
+}
 
-    displayData.statusText = status;
+void updateOtaProgress(int percent) {
+    if (percent > 100) percent = 100;
+    if (percent < 0) percent = -1;
+    if (percent == displayData.otaPercent) return;
+    displayData.otaPercent = percent;
+    if (percent >= 0) displayWake();      // keep the screen on during OTA
     sendDisplayCommand(DISPLAY_UPDATE_HOME);
 }
 

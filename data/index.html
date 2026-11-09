@@ -142,6 +142,27 @@
         <div class="card">
             <div class="section-title">
                 <div>
+                    <h2>Radar Stage Height</h2>
+                    <p>Stored in the radar sensor. Displayed distance = stage height − measured distance. Applied immediately (no reboot).</p>
+                </div>
+                <div class="section-actions">
+                    <button class="secondary" onclick="loadStage()">↻ Read</button>
+                </div>
+            </div>
+            <div class="grid">
+                <label class="field">
+                    <span class="field-label">Stage height</span>
+                    <input id="stageHeight" type="number" step="0.01" min="1" max="1000" placeholder="reading from sensor…">
+                    <small class="field-help">Allowed range 1 – 1000.</small>
+                </label>
+            </div>
+            <div class="data-actions">
+                <button class="primary" id="stageSaveBtn" onclick="saveStage()">Set stage height</button>
+            </div>
+        </div>
+        <div class="card">
+            <div class="section-title">
+                <div>
                     <h2>Sensors</h2>
                     <p id="sensorCount">0 / 12 sensors configured</p>
                 </div>

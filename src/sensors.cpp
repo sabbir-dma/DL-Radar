@@ -130,12 +130,14 @@ void readAllSensorsAndPublish() {
 
         // ---- Dispatch ----
         bool handled = false;
+        bool isSdi12 = false;
         if (strcmp(type, "modbus") == 0) {
             readModbusSensor(sensor, w);
             handled = true;
         } else if (strcmp(type, "sdi12") == 0 || strcmp(type, "sdi-12") == 0 || strcmp(type, "radar") == 0) {
             readSDI12Sensor(sensor, w);
             handled = true;
+            isSdi12 = true;
         }
         // future:
         // else if (strcmp(type, "sdi12")  == 0) { readSDI12Sensor(sensor, w); handled = true; }
@@ -164,15 +166,27 @@ void readAllSensorsAndPublish() {
             continue;
         }
 
+        // Legacy format (SDI-12 only): <device_id>,<raw>+<battery V>+<solar V>+<YYMMDDHHMMSS>
+        const char *payload = jsonBuf;
+        static char legacyBuf[sizeof(MQTTMessage::payload)];
+        if (dataFormat == FMT_LEGACY && isSdi12) {
+            snprintf(legacyBuf, sizeof(legacyBuf), "%s,%s+%.2f+%.2f+%s",
+                     DEVICE_ID.c_str(), w.raw,
+                     storage_getBatteryVoltage(), storage_getSolarVoltage(),
+                     getTimestamp14().c_str());
+            payload = legacyBuf;
+            Serial.printf("[SENSORS] legacy payload: %s\n", legacyBuf);
+        }
+
         MQTTMessage msg = {};
         strncpy(msg.topic, MQTT_PUB.c_str(), sizeof(msg.topic) - 1);
-        strncpy(msg.payload, jsonBuf, sizeof(msg.payload) - 1);
+        strncpy(msg.payload, payload, sizeof(msg.payload) - 1);
         msg.retries = 0;
         msg.sd_log  = sdLog;    // if you added this field earlier
 
         if (xQueueSend(mqttPublishQueue, &msg, pdMS_TO_TICKS(100)) == pdTRUE) {
             Serial.printf("[SENSORS] %s queued (%u bytes)\n",
-                          name, (unsigned)strlen(jsonBuf));
+                          name, (unsigned)strlen(payload));
         } else {
             Serial.println("[SENSORS] MQTT queue full");
         }
