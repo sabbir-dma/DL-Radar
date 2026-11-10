@@ -32,7 +32,7 @@ DisplayData displayData = {
     NAN,      // solarVoltage
     0,        // signalLevel
     "OFFLINE",// statusText
-    75,       // batteryPercent
+    -1,       // batteryPercent (-1 = unknown)
     -1        // otaPercent (-1 = no OTA running)
 };
 
@@ -42,6 +42,25 @@ QueueHandle_t displayCommandQueue = NULL;
 // ============================================================
 // Helper functions (static to avoid external linkage)
 // ============================================================
+// Battery voltage -> percent (piecewise-linear over the discharge table)
+static int batteryPercentFromVoltage(float v) {
+    static const float TBL[][2] = {
+        {7.2f, 100}, {7.0f, 99}, {6.8f, 90}, {6.6f, 80}, {6.5f, 70}, {6.4f, 60},
+        {6.3f, 50},  {6.2f, 40}, {6.1f, 30}, {6.0f, 20}, {5.8f, 10}, {5.5f, 5},
+        {5.2f, 0}
+    };
+    const int N = sizeof(TBL) / sizeof(TBL[0]);
+    if (v >= TBL[0][0])   return 100;
+    if (v <= TBL[N-1][0]) return 0;
+    for (int i = 0; i < N - 1; i++) {
+        if (v <= TBL[i][0] && v > TBL[i+1][0]) {
+            float frac = (v - TBL[i+1][0]) / (TBL[i][0] - TBL[i+1][0]);
+            return (int)(TBL[i+1][1] + frac * (TBL[i][1] - TBL[i+1][1]) + 0.5f);
+        }
+    }
+    return 0;
+}
+
 static void drawBatteryIcon(int percent) {
     if (percent < 0) percent = 0;
     if (percent > 100) percent = 100;
@@ -224,13 +243,15 @@ static void displayHomePage() {
     drawBatteryIcon(displayData.batteryPercent);
     drawSignalBars(displayData.signalLevel);
 
+    // Percentage beside the battery icon
+    char pct[8];
+    if (displayData.batteryPercent < 0) snprintf(pct, sizeof(pct), "--%%");
+    else                                snprintf(pct, sizeof(pct), "%d%%", displayData.batteryPercent);
+    display.setCursor(23, 1);
+    display.print(pct);
+
     const char* title = "DMA_AWLG";
-
-    int16_t x1, y1;
-    uint16_t w, h;
-
-    display.getTextBounds(title, 0, 0, &x1, &y1, &w, &h);
-    display.setCursor((SCREEN_WIDTH - w) / 2, 1);
+    display.setCursor(54, 1);          // right of "100%", left of the signal bars
     display.print(title);
 
     // Header separator
@@ -371,6 +392,9 @@ void updateStageHeight(float value) {
 void updateVoltages(float battery, float solar) {
     displayData.batteryVoltage = battery;
     displayData.solarVoltage   = solar;
+    // 0 V / NAN = INA219 missing -> unknown
+    displayData.batteryPercent = (isnan(battery) || battery < 0.5f) ? -1
+                                 : batteryPercentFromVoltage(battery);
     sendDisplayCommand(DISPLAY_UPDATE_HOME);
 }
 

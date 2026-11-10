@@ -5,6 +5,8 @@
 #include "config.h"
 static String currentRawData = "";
 #include "timeutil.h"
+#include "led.h"
+#include "display.h"
 
 // ============================================================
 // Channel writer helpers
@@ -42,171 +44,213 @@ void appendChannelError(ChannelWriter &w,
 }
 
 // ============================================================
-// Per-sensor last-read tracking (for poll_interval_ms)
+// Latest readings
+// ------------------------------------------------------------
+// Acquisition (reading + SD logging) runs on its own schedule and always keeps
+// the newest result per sensor in `slots`.  Publishing just sends what is stored,
+// so it happens at the exact interval even if the sensor is slow or failing.
 // ============================================================
-static uint32_t lastReadMs[256] = {0};   // indexed by sensor ID (0..255)
+#define MAX_SLOTS   12
+#define SLOT_CH     700
 
-static bool shouldPoll(JsonObject sensor) {
-    int id = sensor["id"] | -1;
-    if (id < 0 || id > 255) return true;
+struct SensorSlot {
+    bool  used;
+    bool  everRead;          // at least one good reading stored
+    bool  lastOk;            // newest attempt succeeded (false => published data is stale)
+    int   id;
+    char  name[32];
+    char  type[16];
+    char  ts[16];            // YYMMDDHHMMSS of the stored reading
+    char  channels[SLOT_CH]; // JSON channel list text
+    char  raw[256];
+    float batt, solar;
+};
+static SensorSlot slots[MAX_SLOTS];
+static SemaphoreHandle_t slotMutex = NULL;
+TaskHandle_t sensorTaskHandle = NULL;
+extern unsigned long DATA_INTERVAL;           // ms, defined in main.cpp
 
-    uint32_t interval = sensor["poll_interval_ms"] | 0;
-    if (interval == 0) return true;      // no per-sensor interval → use global
-
-    uint32_t now = millis();
-    if (now - lastReadMs[id] < interval) return false;
-
-    lastReadMs[id] = now;
-    return true;
-}
-
-// ============================================================
-// Init — call in setup()
-// ============================================================
 void initSensors() {
-    // Nothing protocol-specific needed right now.
-    // Add I2C.begin(), Serial1.begin() for SDI-12, etc. here in the future.
+    slotMutex = xSemaphoreCreateMutex();
     Serial.println("[SENSORS] Dispatcher initialized");
 }
 
-// ============================================================
-// Main dispatcher — call periodically
-// ============================================================
-void readAllSensorsAndPublish() {
-    Serial.println("[SENSORS] --- poll cycle ---");
-    Serial.flush();
+// Time base for the schedule: RTC epoch if valid, else uptime
+uint32_t sensors_scheduleNow() {
+    uint32_t e = storage_getEpoch();
+    return e ? e : (uint32_t)(millis() / 1000);
+}
 
+static void lowerCopy(char *dst, size_t n, const char *src) {
+    size_t i = 0;
+    for (; src[i] && i < n - 1; i++) dst[i] = tolower((unsigned char)src[i]);
+    dst[i] = 0;
+}
+
+// ---- read every enabled sensor, store the result, log to SD ----
+void sensors_acquire() {
+    Serial.println("[SENSORS] --- acquire ---");
+    if (!slotMutex) return;
+
+    static char chBuf[SLOT_CH];
     JsonArray sensors = config["sensors"];
+    int idx = 0;
 
     for (JsonObject sensor : sensors) {
+        if (idx >= MAX_SLOTS) break;
+        int si = idx++;
         if (!(sensor["enabled"] | sensor["sensor_enable"] | true)) continue;
-        if (!shouldPoll(sensor)) continue;
 
-        const char *typeRaw = sensor["type"] | sensor["sensor_type"] | "modbus";
-        // normalize to lowercase for comparison
-        static char typeBuf[32];
-        strncpy(typeBuf, typeRaw, sizeof(typeBuf)-1);
-        typeBuf[sizeof(typeBuf)-1] = 0;
-        for (int i = 0; typeBuf[i]; i++) typeBuf[i] = tolower((unsigned char)typeBuf[i]);
-        const char *type = typeBuf;
+        char type[16];
+        lowerCopy(type, sizeof(type), sensor["type"] | sensor["sensor_type"] | "modbus");
         const char *name = sensor["name"] | "Unknown";
-        int id           = sensor["id"]   | 0;
-        bool sdLog       = sensor["sd_card_logging"] | sensor["sd_logging"] | false;
+        int id = sensor["id"] | 0;
 
-        Serial.printf("[SENSORS] Reading: %s (id=%d, type=%s, sd=%s)\n",
-                      name, id, type, sdLog ? "yes" : "no");
-        Serial.flush();
+        Serial.printf("[SENSORS] Reading: %s (id=%d, type=%s)\n", name, id, type);
 
-        // ---- Build JSON header ----
-        static char jsonBuf[1024];
-        int len = snprintf(jsonBuf, sizeof(jsonBuf),
-            "{\"ts\":\"%s\",\"aos\":%s,"
-            "\"device_id\":\"%s\","
-            "\"type\":\"data\","
-            "\"source\":\"%s\","
-            "\"sensor_id\":%d,"
-            "\"sensor_name\":\"%s\","
-            "\"data\":[",
-            getTimestamp14().c_str(),
-            getAOS() ? "true" : "false",
-            DEVICE_ID.c_str(),
-            type,
-            id,
-            name);
+        chBuf[0] = 0;
+        ChannelWriter w = { .buf = chBuf, .bufSize = sizeof(chBuf), .len = 0,
+                            .first = true, .anyOk = false, .raw = {0} };
 
-        if (len < 0 || len >= (int)sizeof(jsonBuf)) {
-            Serial.println("[SENSORS] JSON header truncated!");
-            continue;
-        }
-
-        ChannelWriter w = {
-            .buf = jsonBuf,
-            .bufSize = sizeof(jsonBuf),
-            .len = len,
-            .first = true,
-            .anyOk = false,
-            .raw = {0}
-        };
-
-        // ---- Dispatch ----
-        bool handled = false;
-        bool isSdi12 = false;
+        bool ok = false;
         if (strcmp(type, "modbus") == 0) {
-            readModbusSensor(sensor, w);
-            handled = true;
+            ok = readModbusSensor(sensor, w);
         } else if (strcmp(type, "sdi12") == 0 || strcmp(type, "sdi-12") == 0 || strcmp(type, "radar") == 0) {
-            readSDI12Sensor(sensor, w);
-            handled = true;
-            isSdi12 = true;
-        }
-        // future:
-        // else if (strcmp(type, "sdi12")  == 0) { readSDI12Sensor(sensor, w); handled = true; }
-        // else if (strcmp(type, "analog") == 0) { readAnalogSensor(sensor, w); handled = true; }
-        // else if (strcmp(type, "i2c")    == 0) { readI2CSensor(sensor, w);    handled = true; }
-
-        if (!handled) {
+            ok = readSDI12Sensor(sensor, w);
+        } else {
             Serial.printf("[SENSORS] Unknown type: %s\n", type);
             continue;
         }
 
-        // ---- Close JSON ----
-        int tail = snprintf(jsonBuf + w.len, sizeof(jsonBuf) - w.len, "]}");
-        if (tail < 0 || w.len + tail >= (int)sizeof(jsonBuf)) {
-            Serial.println("[SENSORS] JSON tail truncated!");
-            continue;
-        }
-        w.len += tail;
+        String ts = getTimestamp14();
+        float batt = storage_getBatteryVoltage();
+        float solar = storage_getSolarVoltage();
 
-        Serial.println("--------------------------------------");
-        Serial.flush();
-
-        // ---- Publish (even all-error payloads go out) ----
-        if (mqttPublishQueue == NULL) {
-            Serial.println("[SENSORS] mqttPublishQueue is NULL");
-            continue;
+        xSemaphoreTake(slotMutex, portMAX_DELAY);
+        SensorSlot &sl = slots[si];
+        sl.used = true;
+        sl.id = id;
+        strncpy(sl.name, name, sizeof(sl.name) - 1);
+        strncpy(sl.type, type, sizeof(sl.type) - 1);
+        if (ok || !sl.everRead) {
+            // good reading, or nothing good stored yet (keep the error text so something is published)
+            strncpy(sl.channels, chBuf, sizeof(sl.channels) - 1);
+            strncpy(sl.raw, w.raw, sizeof(sl.raw) - 1);
+            strncpy(sl.ts, ts.c_str(), sizeof(sl.ts) - 1);
+            sl.batt = batt;
+            sl.solar = solar;
+            if (ok) sl.everRead = true;
         }
+        sl.lastOk = ok;
+        xSemaphoreGive(slotMutex);
 
-        // Legacy format (SDI-12 only): <device_id>,<raw>+<battery V>+<solar V>+<YYMMDDHHMMSS>
-        const char *payload = jsonBuf;
-        static char legacyBuf[sizeof(MQTTMessage::payload)];
-        if (dataFormat == FMT_LEGACY && isSdi12) {
-            snprintf(legacyBuf, sizeof(legacyBuf), "%s,%s+%.2f+%.2f+%s",
-                     DEVICE_ID.c_str(), w.raw,
-                     storage_getBatteryVoltage(), storage_getSolarVoltage(),
-                     getTimestamp14().c_str());
-            payload = legacyBuf;
-            Serial.printf("[SENSORS] legacy payload: %s\n", legacyBuf);
-        }
+        if (!ok) Serial.println("[SENSORS] read FAILED -> previous reading stays as latest");
+
+        // SD logging happens here, always - independent of network state
+        storage_logData(String(name), String(w.raw));
+    }
+    Serial.println("[SENSORS] --- acquire done ---");
+}
+
+// ---- publish the stored readings (no sensor access) ----
+void sensors_publishLatest() {
+    if (!deviceOnline || mqttPublishQueue == NULL || !slotMutex) {
+        Serial.println("[PUBLISH] offline - skipped (data is on the SD card)");
+        return;
+    }
+
+    for (int i = 0; i < MAX_SLOTS; i++) {
+        static SensorSlot sl;                       // local copy, keep the lock short
+        xSemaphoreTake(slotMutex, portMAX_DELAY);
+        sl = slots[i];
+        xSemaphoreGive(slotMutex);
+        if (!sl.used) continue;
 
         MQTTMessage msg = {};
         strncpy(msg.topic, MQTT_PUB.c_str(), sizeof(msg.topic) - 1);
-        strncpy(msg.payload, payload, sizeof(msg.payload) - 1);
-        msg.retries = 0;
-        msg.sd_log  = sdLog;    // if you added this field earlier
 
-        if (xQueueSend(mqttPublishQueue, &msg, pdMS_TO_TICKS(100)) == pdTRUE) {
-            Serial.printf("[SENSORS] %s queued (%u bytes)\n",
-                          name, (unsigned)strlen(payload));
+        bool sdi = (strcmp(sl.type, "sdi12") == 0 || strcmp(sl.type, "sdi-12") == 0 || strcmp(sl.type, "radar") == 0);
+        const char *ts = sl.ts[0] ? sl.ts : "000000000000";
+
+        if (dataFormat == FMT_LEGACY && sdi) {
+            snprintf(msg.payload, sizeof(msg.payload), "%s,%s+%.2f+%.2f+%s",
+                     DEVICE_ID.c_str(), sl.raw, sl.batt, sl.solar, ts);
         } else {
-            Serial.println("[SENSORS] MQTT queue full");
+            snprintf(msg.payload, sizeof(msg.payload),
+                "{\"ts\":\"%s\",\"aos\":%s,\"device_id\":\"%s\",\"type\":\"data\","
+                "\"source\":\"%s\",\"sensor_id\":%d,\"sensor_name\":\"%s\"%s,\"data\":[%s]}",
+                ts, getAOS() ? "true" : "false", DEVICE_ID.c_str(),
+                sl.type, sl.id, sl.name,
+                (showStale && sl.everRead && !sl.lastOk) ? ",\"stale\":true" : "",
+                sl.channels);
         }
-        Serial.flush();
+        msg.retries = 0;
 
-        // Log to SD card
-        storage_logData(String(name), String(w.raw));
+        if (xQueueSend(mqttPublishQueue, &msg, pdMS_TO_TICKS(100)) == pdTRUE)
+            Serial.printf("[PUBLISH] %s queued%s\n", sl.name, (sl.everRead && !sl.lastOk) ? " (previous reading)" : "");
+        else
+            Serial.println("[PUBLISH] MQTT queue full");
     }
+    sendLedCommand(LED_RF_HB);
+}
 
-    Serial.println("[SENSORS] --- cycle done ---");
-    Serial.flush();
+// Kept for compatibility: read now, then publish
+void readAllSensorsAndPublish() {
+    sensors_acquire();
+    sensors_publishLatest();
+}
+
+// ---- acquisition task ----
+// Measures so the result is ready before the publish time:
+//   publish times are multiples of DATA_INTERVAL (RTC aligned), reading starts LEAD seconds before.
+static volatile bool g_publishAfterRead = false;
+
+void sensors_requestReadAndPublish() {
+    g_publishAfterRead = true;
+    if (sensorTaskHandle) xTaskNotifyGive(sensorTaskHandle);
+}
+
+static void sensorTask(void *) {
+    uint32_t lastMeasuredSlot = 0;
+    bool first = true;                       // one reading right at start so "data" has something
+
+    for (;;) {
+        bool force = ulTaskNotifyTake(pdTRUE, 0) > 0;
+
+        uint32_t iv = DATA_INTERVAL / 1000;
+        if (iv < 30) iv = 30;
+        uint32_t now = sensors_scheduleNow();
+        uint32_t nextSlot = (now / iv + 1) * iv;
+
+        // lead = 3.5 min, or the last real measurement time + 30 s if that is longer
+        uint32_t lead = 210;
+        uint32_t lastMs = radarLastMeasureMs();
+        if (lastMs / 1000 + 30 > lead) lead = lastMs / 1000 + 30;
+
+        if (first || force || (nextSlot != lastMeasuredSlot && now + lead >= nextSlot)) {
+            first = false;
+            lastMeasuredSlot = nextSlot;
+            sensors_acquire();
+            updateVoltages(storage_getBatteryVoltage(), storage_getSolarVoltage());
+            if (g_publishAfterRead) {        // MQTT "data_read"
+                g_publishAfterRead = false;
+                sensors_publishLatest();
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
+void sensors_start() {
+    if (sensorTaskHandle) return;
+    xTaskCreatePinnedToCore(sensorTask, "SensorTask", 8192, NULL, 2, &sensorTaskHandle, 1);
 }
 
 // ============================================================
 // SDI-12 (radar) reader — read & publish raw data
 // ============================================================
 bool readSDI12Sensor(JsonObject sensor, ChannelWriter &w) {
-    const char *addr = sensor["sdi12"]["address"] | "0";
-    if (addr && addr[0]) SENSOR_ADDR = addr[0];
-
+    // SENSOR_ADDR is learned once at setup (stored in flash); no config override here
     String rawData;
     bool ok = measureM3(rawData);
 

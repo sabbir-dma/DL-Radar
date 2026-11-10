@@ -12,7 +12,7 @@
 #define NUM_LEDS        1
 #define LED_TASK_PRIORITY      1
 #define LED_CMD_QUEUE_SIZE     10
-#define LED_TASK_STACK         2048
+#define LED_TASK_STACK         3072
 
 // ============================================================
 // LED Command Types

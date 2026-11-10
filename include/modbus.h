@@ -26,6 +26,7 @@ void rs485RxMode();
 
 bool loadConfig();
 void printConfig();
+void normalizeSensors(JsonDocument &doc);   // drop the protocol block a sensor does not use
 void configureRS485(JsonObject modbus);
 
 bool readRegisters(uint8_t slaveId,

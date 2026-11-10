@@ -27,7 +27,16 @@ static bool sdReady  = false;
 
 static unsigned long lastNtpSyncDay = 0;
 
+// RTC and INA219 share one I2C bus and are used from several tasks -> serialise access
+static SemaphoreHandle_t i2cMutex = NULL;
+struct I2CLock {
+    I2CLock()  { if (!i2cMutex) i2cMutex = xSemaphoreCreateRecursiveMutex();
+                 xSemaphoreTakeRecursive(i2cMutex, portMAX_DELAY); }
+    ~I2CLock() { xSemaphoreGiveRecursive(i2cMutex); }
+};
+
 void storage_setup() {
+    if (!i2cMutex) i2cMutex = xSemaphoreCreateRecursiveMutex();
     Serial.println("[STORAGE] Initializing...");
     Wire.begin(I2C_SDA, I2C_SCL);
 
@@ -68,8 +77,17 @@ bool storage_sd_ready()  { return sdReady; }
 bool storage_rtc_ready() { return rtcReady; }
 bool storage_ina_ready() { return inaReady; }
 
+uint32_t storage_getEpoch() {
+    if (!rtcReady) return 0;
+    I2CLock lk;
+    DateTime now = rtc.now();
+    if (now.year() < 2024) return 0;      // RTC not set yet
+    return now.unixtime();
+}
+
 String storage_getTimestamp14() {
     if (!rtcReady) return String("000000000000");
+    I2CLock lk;
     DateTime now = rtc.now();
     char buf[16];
     snprintf(buf, sizeof(buf), "%02d%02d%02d%02d%02d%02d",
@@ -86,6 +104,7 @@ float storage_getSolarVoltage() {
 
 float storage_getBatteryVoltage() {
     if (!inaReady) return 0.0f;
+    I2CLock lk;
     return ina219.getBusVoltage_V();
 }
 
@@ -97,7 +116,8 @@ int storage_getCSQ() {
 void storage_logData(const String &sensorName, const String &rawData) {
     if (!sdReady || !rtcReady) return;
 
-    DateTime now = rtc.now();
+    DateTime now;
+    { I2CLock lk; now = rtc.now(); }
     char fname[32];
     snprintf(fname, sizeof(fname), "/%04d%02d.csv", now.year(), now.month());
 
@@ -195,7 +215,7 @@ bool storage_updateRTCFromNTP() {
         return false;
     }
 
-    rtc.adjust(DateTime(year, month, day, hour, minute, second));
+    { I2CLock lk; rtc.adjust(DateTime(year, month, day, hour, minute, second)); }
     Serial.println("[RTC] Updated successfully from NTP.");
     return true;
 }
@@ -203,7 +223,8 @@ bool storage_updateRTCFromNTP() {
 void storage_handlePeriodic() {
     if (!rtcReady) return;
 
-    DateTime now = rtc.now();
+    DateTime now;
+    { I2CLock lk; now = rtc.now(); }
 
     if (now.hour() == 0 && now.minute() == 0 && now.second() == 1) {
         static uint32_t lastSyncDay = 0;

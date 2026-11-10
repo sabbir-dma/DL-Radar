@@ -22,7 +22,7 @@ extern bool buttonState;
 
 #define DISPLAY_TASK_PRIORITY   1
 #define DISPLAY_CMD_QUEUE_SIZE  10
-#define DISPLAY_TASK_STACK      4096
+#define DISPLAY_TASK_STACK      6144
 
 enum DisplayCommandType {
     DISPLAY_BOOT,

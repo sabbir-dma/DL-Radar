@@ -27,11 +27,13 @@ bool modemWasInitialized = false;
 
 String MQTT_PUB;
 String MQTT_SUB;
-
+String MQTT_HB;
 
 void setupMQTTTopics() {
-    MQTT_PUB          = "DMA-DL/PUB/"           + DEVICE_ID;
-    MQTT_SUB          = "DMA-DL/SUB/"           + DEVICE_ID;
+    // MQTT_PUB          = "DMA-DL/PUB/"           + DEVICE_ID;
+    MQTT_PUB          = "DMA-RADAR/PUB";
+    MQTT_SUB          = "DMA-RADAR/SUB/"           + DEVICE_ID;
+    MQTT_HB           = "DMA-RADAR/HB";
 }
 
 

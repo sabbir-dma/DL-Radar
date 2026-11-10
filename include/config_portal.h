@@ -4,6 +4,8 @@
 #include <LittleFS.h>
 #include <ArduinoJson.h>
 #include <SD.h>
+#include <Update.h>
+#include "display.h"
 #include "storage.h"
 #include "radar.h"
 
@@ -288,6 +290,8 @@ void handleSetConfig()
         return;
     }
 
+    normalizeSensors(incoming);
+
     // Force device.id to stay unchanged (read-only in UI).
     if (config["device"]["id"].is<const char*>()) {
         incoming["device"]["id"] = config["device"]["id"];
@@ -531,6 +535,73 @@ void handleSetStage() {
     sendJson(200, doc);
 }
 
+
+// ---------- Firmware upload (full image, from the portal) ----------
+// Upload build output "firmware.bin" (app image). Device reboots when done.
+
+static String fwErr;
+static bool   fwOk = false;
+static bool   fwFirst = true;
+static int    fwLastPct = -1;
+
+void handleFirmwareUpload() {
+    HTTPUpload &up = server.upload();
+
+    if (up.status == UPLOAD_FILE_START) {
+        fwErr = ""; fwOk = false; fwFirst = true; fwLastPct = -1;
+        Serial.printf("[FW] upload start: %s\n", up.filename.c_str());
+        if (!up.filename.endsWith(".bin")) { fwErr = "Select a .bin firmware file"; return; }
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) { fwErr = Update.errorString(); return; }
+        updateOtaProgress(0);
+
+    } else if (up.status == UPLOAD_FILE_WRITE) {
+        if (fwErr.length()) return;
+        if (fwFirst) {
+            fwFirst = false;
+            if (up.buf[0] != 0xE9) {                 // ESP32 image magic byte
+                fwErr = "Not an ESP32 firmware image";
+                Update.abort();
+                return;
+            }
+        }
+        if (Update.write(up.buf, up.currentSize) != up.currentSize) {
+            fwErr = Update.errorString();
+            Update.abort();
+            return;
+        }
+        int total = server.clientContentLength();
+        if (total > 0) {
+            int pct = (int)((100ULL * (up.totalSize + up.currentSize)) / total);
+            if (pct > 99) pct = 99;
+            if (pct != fwLastPct) {
+                fwLastPct = pct;
+                updateOtaProgress(pct);
+                if (pct % 10 == 0) Serial.printf("[FW] %d%%\n", pct);
+            }
+        }
+
+    } else if (up.status == UPLOAD_FILE_END) {
+        if (fwErr.length()) return;
+        if (Update.end(true)) { fwOk = true; updateOtaProgress(100); Serial.printf("[FW] done, %u bytes\n", (unsigned)up.totalSize); }
+        else                  fwErr = Update.errorString();
+
+    } else if (up.status == UPLOAD_FILE_ABORTED) {
+        Update.abort();
+        fwErr = "Upload aborted";
+    }
+}
+
+void handleFirmwareDone() {
+    if (fwOk) {
+        sendMessage(200, true, "Firmware installed - rebooting");
+        delay(800);
+        ESP.restart();
+    } else {
+        updateOtaProgress(-1);
+        sendMessage(500, false, fwErr.length() ? fwErr.c_str() : "Upload failed");
+    }
+}
+
 void handleNotFound()
 {
     server.send(404, "text/plain", "Not found");
@@ -656,6 +727,7 @@ void setupWebServer()
     server.on("/api/config",       HTTP_GET,  handleGetConfig);
     server.on("/api/config",       HTTP_POST, handleSetConfig);
     server.on("/api/config/reset", HTTP_POST, handleResetConfig);
+    server.on("/api/update",       HTTP_POST, handleFirmwareDone, handleFirmwareUpload);
     server.on("/api/stage",        HTTP_GET,  handleGetStage);
     server.on("/api/stage",        HTTP_POST, handleSetStage);
     server.on("/api/files",        HTTP_GET,  handleFiles);

@@ -70,6 +70,29 @@
                 </label>
             </div>
         </div>
+        <div class="card">
+            <div class="section-title">
+                <div>
+                    <h2>Firmware Update</h2>
+                    <p>Upload a full firmware image (<code>firmware.bin</code>). The device reboots when finished — do not power off during the upload.</p>
+                </div>
+            </div>
+            <div class="grid">
+                <label class="field field-wide">
+                    <span class="field-label">Firmware file (.bin)</span>
+                    <input id="fwFile" type="file" accept=".bin">
+                </label>
+            </div>
+            <div id="fwProgressWrap" style="display:none; margin:10px 0;">
+                <div style="height:12px; background:#e5e7eb; border-radius:6px; overflow:hidden;">
+                    <div id="fwBar" style="height:100%; width:0%; background:#2563eb; transition:width .2s;"></div>
+                </div>
+                <small id="fwPct">0%</small>
+            </div>
+            <div class="data-actions">
+                <button class="primary" id="fwBtn" onclick="uploadFirmware()">Upload &amp; Install</button>
+            </div>
+        </div>
     </section>
 
     <!-- ===== NETWORK TAB ===== -->

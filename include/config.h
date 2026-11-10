@@ -10,15 +10,15 @@
 
 // ==================== Configuration ====================
 #define HW_VERSION "v1.2610.1"
-#define FW_VERSION "v1.2610.2"
-#define OTA_DATE "261020"
+#define FW_VERSION "v1.2611.1"
+#define OTA_DATE "261109"
 //-------------------------------------------------------//
 
 #define OTA 1  // Set to 1 for OTA mode, 0 for normal mode
 #define WORK_PACKAGE             "1292"
 #define DEVICE_TYPE              "03"
 #define DEVICE_CODE_UPLOAD_DATE  "261011"
-#define DEVICE_SERIAL_ID         "0099"
+#define DEVICE_SERIAL_ID         "0003"
 
 #define UNIQUE_DEVICE_ID WORK_PACKAGE DEVICE_TYPE DEVICE_CODE_UPLOAD_DATE DEVICE_SERIAL_ID
 //=========================================================================================//
@@ -45,10 +45,10 @@ extern String MAC_FALLBACK_ID;
 
 // Timing Configuration (const variables are okay in header)
 
-// unsigned long HEARTBEAT_INTERVAL;
+extern unsigned long HEARTBEAT_INTERVAL;   // ms (default 5 min)
 extern unsigned long lastHeartbeatTime;
 
-// unsigned long DATA_INTERVAL;
+extern unsigned long DATA_INTERVAL;        // ms (default 5 min)
 extern unsigned long lastDataTime;
 
 const unsigned long MAIN_TASK_PRIORITY = 2;
@@ -70,6 +70,7 @@ extern bool modemWasInitialized;
 // MQTT Topics (now dynamic, built at runtime with DEVICE_ID)
 extern String MQTT_PUB;
 extern String MQTT_SUB;
+extern String MQTT_HB;
 
 // Call this once, after DEVICE_ID has been assigned
 void setupMQTTTopics();
@@ -87,6 +88,7 @@ struct MQTTMessage {
 // FMT_LEGACY : <device_id>,<raw sdi12>+<battery V>+<solar V>+<YYMMDDHHMMSS>
 enum DataFormat : uint8_t { FMT_JSON = 0, FMT_LEGACY = 1 };
 extern volatile uint8_t dataFormat;
+extern volatile bool showStale;      // add "stale":true to JSON when the previous reading is re-published (default off)
 
 // Helper function prototype
 String getMACDeviceID();

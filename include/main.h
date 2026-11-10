@@ -13,7 +13,7 @@
 
 // ==================== Main Task Configuration ====================
 #define MAIN_TASK_PRIORITY 2
-#define MAIN_TASK_STACK 4096
+#define MAIN_TASK_STACK 8192
 #define MQTT_PUB_QUEUE_SIZE 32
 
 // ==================== Global Variables ====================

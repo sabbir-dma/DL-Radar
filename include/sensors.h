@@ -30,7 +30,13 @@ void appendChannelError(ChannelWriter &w,
 // Dispatcher
 // ============================================================
 void initSensors();                  // call once in setup()
-void readAllSensorsAndPublish();     // call periodically
+void sensors_start();                // start the acquisition task (after config is loaded)
+void sensors_acquire();              // read all sensors, store as "latest", log to SD
+void sensors_publishLatest();        // publish the stored latest readings (no sensor access)
+void sensors_requestReadAndPublish();// MQTT data_read: read now, publish when done
+uint32_t sensors_scheduleNow();      // schedule clock (RTC epoch, or uptime if RTC invalid)
+void readAllSensorsAndPublish();     // read now + publish (kept for compatibility)
+extern TaskHandle_t sensorTaskHandle;
 
 // ============================================================
 // Protocol reader prototypes

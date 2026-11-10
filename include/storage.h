@@ -7,6 +7,9 @@ bool storage_sd_ready();
 bool storage_rtc_ready();
 bool storage_ina_ready();
 
+// Seconds since epoch of the RTC clock (0 if RTC missing / time not valid yet)
+uint32_t storage_getEpoch();
+
 // Returns "YYMMDDHHMMSS"
 String storage_getTimestamp14();
 

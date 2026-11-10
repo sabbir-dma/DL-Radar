@@ -138,8 +138,23 @@ bool loadConfig() {
     Serial.printf("[CFG] sensors[] count: %u\n",
                   (unsigned)config["sensors"].as<JsonArray>().size());
 
+    normalizeSensors(config);
     Serial.println("[CFG] Configuration loaded OK");
     return true;
+}
+
+// A sensor keeps only the block for its own protocol (SDI-12 -> "sdi12",
+// anything else -> "modbus"), so e.g. an SDI-12 sensor never carries Modbus settings.
+void normalizeSensors(JsonDocument &doc)
+{
+    if (!doc["sensors"].is<JsonArray>()) return;
+    for (JsonObject s : doc["sensors"].as<JsonArray>()) {
+        String t = s["sensor_type"] | s["type"] | "MODBUS";
+        t.toUpperCase();
+        bool sdi = (t == "SDI12" || t == "SDI-12" || t == "RADAR");
+        if (sdi) s.remove("modbus");
+        else     s.remove("sdi12");
+    }
 }
 
 void printConfig()

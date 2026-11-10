@@ -1,5 +1,8 @@
 #include "main.h"
 #include <stdarg.h>
+#include "esp32/rom/crc.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
 #include <math.h>
 
 #include "config_portal.h"
@@ -13,7 +16,8 @@ Preferences preferences;
 
 unsigned long HEARTBEAT_INTERVAL;
 unsigned long DATA_INTERVAL;
-volatile uint8_t dataFormat = FMT_JSON;
+volatile uint8_t dataFormat = FMT_LEGACY;
+volatile bool showStale = false;
 
 // ==================== Setup ====================
 void setup() {
@@ -43,8 +47,8 @@ void setup() {
         preferences.begin("device", true);
         DEVICE_ID = preferences.getString("DID", MAC_FALLBACK_ID);
 
-        HEARTBEAT_INTERVAL = preferences.getULong("hb_inv", 180000);
-        DATA_INTERVAL      = preferences.getULong("dt_inv", 120000);
+        HEARTBEAT_INTERVAL = preferences.getULong("hb_inv", 300000);
+        DATA_INTERVAL      = preferences.getULong("dt_inv", 300000);
 
         preferences.end();
 
@@ -61,8 +65,8 @@ void setup() {
             preferences.putString("DID", DEVICE_ID);
         }
 
-        HEARTBEAT_INTERVAL = preferences.getULong("hb_inv", 180000);
-        DATA_INTERVAL      = preferences.getULong("dt_inv", 120000);
+        HEARTBEAT_INTERVAL = preferences.getULong("hb_inv", 300000);
+        DATA_INTERVAL      = preferences.getULong("dt_inv", 300000);
         
         preferences.end();
     #endif
@@ -71,6 +75,10 @@ void setup() {
     dataFormat = preferences.getUChar("dfmt", FMT_JSON) == FMT_LEGACY ? FMT_LEGACY : FMT_JSON;
     preferences.end();
     SerialMon.printf("Data format: %s\n", dataFormat == FMT_LEGACY ? "legacy" : "json");
+    preferences.begin("device", true);
+    showStale = preferences.getBool("stale", false);
+    preferences.end();
+    SerialMon.printf("Stale marker: %s\n", showStale ? "on" : "off");
 
     SerialMon.println("Final Device ID: " + DEVICE_ID);
     SerialMon.println("=================================\n");
@@ -119,6 +127,7 @@ void setup() {
     SerialMon.printf("Config version: %d\n", config["config_version"] | 0);
     printConfig();
 
+    sensors_start();     // acquisition: reads sensors + logs to SD, online or not
     xTaskCreatePinnedToCore(mainTask, "MainTask", MAIN_TASK_STACK, NULL, MAIN_TASK_PRIORITY, &mainTaskHandle, 1);
 
     SerialMon.println("Setup complete!!!");
@@ -139,19 +148,29 @@ void loop() {
 // ==================== Main Task ====================
 void mainTask(void* parameter) {
     unsigned long lastHeartbeatTime = 0;
-    unsigned long lastDataTime = 0;  // Added to track sensor data interval
-    
+
     SerialMon.println("Main Task started");
     updateVoltages(storage_getBatteryVoltage(), storage_getSolarVoltage());
     updateBatteryPercentage(100);  // Initialize battery percentage to 100% at startup
-    
+
+    // Publish times are multiples of DATA_INTERVAL on the (RTC) clock.
+    // The SensorTask has the reading ready ~3.5 min before; here we only send what is stored.
+    auto slotOf = []() -> uint32_t {
+        uint32_t iv = DATA_INTERVAL / 1000;
+        if (iv < 30) iv = 30;
+        return (sensors_scheduleNow() / iv) * iv;
+    };
+    uint32_t lastPubSlot = slotOf();       // no publish at boot; first one at the next boundary
+    bool     pendingPub  = false;          // slot reached while offline -> retry briefly
+    uint32_t pendingSince = 0;
+
     while (1) {
         if (otaInProgress) {
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
 
-        // Send heartbeat every minute
+        // Heartbeat every HEARTBEAT_INTERVAL
         if (millis() - lastHeartbeatTime >= HEARTBEAT_INTERVAL) {
             if (deviceOnline) {
                 publishHeartbeat();
@@ -162,25 +181,32 @@ void mainTask(void* parameter) {
             }
         }
 
-        // Send sensor data every DATA_INTERVAL
-        if (millis() - lastDataTime >= DATA_INTERVAL) {
-            lastDataTime = millis();
+        // Exact-time data publish
+        uint32_t cur = slotOf();
+        if (cur < lastPubSlot) lastPubSlot = cur;            // clock moved back
+        if (cur > lastPubSlot) {
+            lastPubSlot = cur;
+            pendingPub = true;
+            pendingSince = sensors_scheduleNow();
+        }
+        if (pendingPub) {
             if (deviceOnline) {
-                SerialMon.println("Reading sensors and publishing data...");
-
-                Serial.println("[MAIN] Calling radar read");
-                Serial.flush();
-                readAllSensorsAndPublish();
-                Serial.println("[MAIN] Radar read done");
-                Serial.flush();
+                SerialMon.println("Publishing latest data...");
+                sensors_publishLatest();
                 updateVoltages(storage_getBatteryVoltage(), storage_getSolarVoltage());
-                updateBatteryPercentage((int)((storage_getBatteryVoltage() / 7.4) * 100)); // Assuming 4.2V is full battery
-
-                SerialMon.println("Sensor data published");
-                sendLedCommand(LED_RF_HB);
+                updateBatteryPercentage((int)((storage_getBatteryVoltage() / 7.4) * 100));
+                pendingPub = false;
+            } else if (sensors_scheduleNow() - pendingSince > 90) {
+                SerialMon.println("Offline at publish time - skipped (data is on the SD card)");
+                pendingPub = false;
             }
         }
-        
+
+        // MQTT "data": publish the stored latest data right now
+        if (ulTaskNotifyTake(pdTRUE, 0) > 0) {
+            sensors_publishLatest();
+        }
+
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
@@ -257,7 +283,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     if (message.startsWith("set_pub_interval:")) {
         unsigned long newInterval = message.substring(17).toInt();
 
-        if (newInterval >= 30 && newInterval <= 900) {
+        if (newInterval >= 240 && newInterval <= 3600) {
             newInterval = newInterval * 1000;
             preferences.begin("device", false);
             preferences.putULong("dt_inv", newInterval);
@@ -272,10 +298,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
             // ESP.restart();
         }
         else {
-            Serial.println("interval time limit exeeded! [30-900]");
+            Serial.println("interval time limit exceeded! [240-3600]");
             MQTTMessage response2 = {};     // ← zeroes retries
             snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
-            snprintf(response2.payload, sizeof(response2.payload), "['limit exeeded (30-900)']");
+            snprintf(response2.payload, sizeof(response2.payload), "['limit exceeded (240-3600)']");
             sendLedCommand(LED_PING_ACK);
             xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
         }
@@ -285,156 +311,6 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     if (message == "ping") {
         SerialMon.println("MQTT Command: Ping received");
         publishHeartbeat();
-        return;
-    }
-
-    if (message == "factoryReset") {
-        SerialMon.println("MQTT Command: Factory Reset received");
-        if (factoryReset()) {
-            SerialMon.println("Factory Reset successful. Restarting...");
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            MQTTMessage response2 = {};     // ← zeroes retries
-            snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
-            snprintf(response2.payload, sizeof(response2.payload), "[Sensor Factory Reset successful. Device restarting...]");
-            sendLedCommand(LED_PING_ACK);
-            xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
-        } else {
-            SerialMon.println("Factory Reset failed.");
-            MQTTMessage response2 = {};     // ← zeroes retries
-            snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
-            snprintf(response2.payload, sizeof(response2.payload), "[Sensor Factory Reset failed.]");
-            sendLedCommand(LED_PING_ACK);
-            xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
-        }
-        return;
-    }
-
-    if (message == "setPowerHigh") {
-        if (setPowerHigh()) {
-            SerialMon.println("MQTT Command: Set Power High received");
-            MQTTMessage response2 = {};     // ← zeroes retries
-            snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
-            snprintf(response2.payload, sizeof(response2.payload), "['Power set to HIGH']");
-            sendLedCommand(LED_PING_ACK);
-            xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
-        } else {
-            SerialMon.println("MQTT Command: Set Power High failed");
-            MQTTMessage response2 = {};     // ← zeroes retries
-            snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
-            snprintf(response2.payload, sizeof(response2.payload), "['Failed to set power to HIGH']");
-            sendLedCommand(LED_PING_ACK);
-            xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
-        }
-        return;
-    }
-
-    if (message == "setPowerLow") {
-        if (setPowerLow()) {
-            SerialMon.println("MQTT Command: Set Power Low received");
-            MQTTMessage response2 = {};     // ← zeroes retries
-            snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
-            snprintf(response2.payload, sizeof(response2.payload), "['Power set to LOW']");
-            sendLedCommand(LED_PING_ACK);
-            xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
-        } else {
-            SerialMon.println("MQTT Command: Set Power Low failed");
-            MQTTMessage response2 = {};     // ← zeroes retries
-            snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
-            snprintf(response2.payload, sizeof(response2.payload), "['Failed to set power to LOW']");
-            sendLedCommand(LED_PING_ACK);
-            xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
-        }
-        return;
-    }
-
-    if (message == "getPowerMode") {
-        if (getPowerMode() == "H") {
-            SerialMon.println("MQTT Command: Get Power Mode received");
-            MQTTMessage response2 = {};     // ← zeroes retries
-            snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
-            snprintf(response2.payload, sizeof(response2.payload), "['Current Power Mode: HIGH']");
-            sendLedCommand(LED_PING_ACK);
-            xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
-        } else if (getPowerMode() == "L") {
-            SerialMon.println("MQTT Command: Get Power Mode received");
-            MQTTMessage response2 = {};     // ← zeroes retries
-            snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
-            snprintf(response2.payload, sizeof(response2.payload), "['Current Power Mode: LOW']");
-            sendLedCommand(LED_PING_ACK);
-            xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
-        } else {
-            SerialMon.println("MQTT Command: Get Power Mode failed");
-            MQTTMessage response2 = {};     // ← zeroes retries
-            snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
-            snprintf(response2.payload, sizeof(response2.payload), "['Failed to get power mode']");
-            sendLedCommand(LED_PING_ACK);
-            xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
-        }
-        return;
-    }
-
-    if (message == "setUnitMeters") {
-        if (setUnitMeters()) {
-            SerialMon.println("MQTT Command: Set Unit Meters received");
-            MQTTMessage response2 = {};     // ← zeroes retries
-            snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
-            snprintf(response2.payload, sizeof(response2.payload), "['Unit set to METERS']");
-            sendLedCommand(LED_PING_ACK);
-            xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
-        } else {
-            SerialMon.println("MQTT Command: Set Unit Meters failed");
-            MQTTMessage response2 = {};     // ← zeroes retries
-            snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
-            snprintf(response2.payload, sizeof(response2.payload), "['Failed to set unit to METERS']");
-            sendLedCommand(LED_PING_ACK);
-            xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
-        }
-        return;
-    }
-
-    if (message == "setUnitFeets") {
-        if (setUnitFeets()) {
-            SerialMon.println("MQTT Command: Set Unit Feets received");
-            MQTTMessage response2 = {};     // ← zeroes retries
-            snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
-            snprintf(response2.payload, sizeof(response2.payload), "['Unit set to FEETS']");
-            sendLedCommand(LED_PING_ACK);
-            xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
-        } else {
-            SerialMon.println("MQTT Command: Set Unit Feets failed");
-            MQTTMessage response2 = {};     // ← zeroes retries
-            snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
-            snprintf(response2.payload, sizeof(response2.payload), "['Failed to set unit to FEETS']");
-            sendLedCommand(LED_PING_ACK);
-            xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
-        }
-        return;
-    }
-
-    if (message == "getUnit") {
-        String unit = getUnit();
-        if (unit == "M") {
-            SerialMon.println("MQTT Command: Get Unit received");
-            MQTTMessage response2 = {};     // ← zeroes retries
-            snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
-            snprintf(response2.payload, sizeof(response2.payload), "['Current Unit: METERS']");
-            sendLedCommand(LED_PING_ACK);
-            xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
-        } else if (unit == "F") {
-            SerialMon.println("MQTT Command: Get Unit received");
-            MQTTMessage response2 = {};     // ← zeroes retries
-            snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
-            snprintf(response2.payload, sizeof(response2.payload), "['Current Unit: FEETS']");
-            sendLedCommand(LED_PING_ACK);
-            xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
-        } else {
-            SerialMon.println("MQTT Command: Get Unit failed");
-            MQTTMessage response2 = {};     // ← zeroes retries
-            snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
-            snprintf(response2.payload, sizeof(response2.payload), "['Failed to get unit']");
-            sendLedCommand(LED_PING_ACK);
-            xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
-        }
         return;
     }
 
@@ -448,6 +324,41 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         sendLedCommand(LED_PING_ACK);
         xQueueSend(mqttPublishQueue, &r, pdMS_TO_TICKS(100));
     };
+
+    // ---- Radar sensor commands: only queued here; radarTask runs them and replies ----
+    struct { const char *name; RadarCmdType type; } radarCmds[] = {
+        { "factoryReset",  RCMD_FACTORY_RESET  },
+        { "setPowerHigh",  RCMD_SET_POWER_HIGH },
+        { "setPowerLow",   RCMD_SET_POWER_LOW  },
+        { "getPowerMode",  RCMD_GET_POWER      },
+        { "setUnitMeters", RCMD_SET_UNIT_M     },
+        { "setUnitFeets",  RCMD_SET_UNIT_FT    },
+        { "getUnit",       RCMD_GET_UNIT       },
+        { "getSamples",    RCMD_GET_SAMPLES    },
+        { "getStageHeight",RCMD_GET_STAGE      },
+    };
+    for (auto &c : radarCmds) {
+        if (message == c.name) {
+            if (!radarSendCommand(c.type)) reply("['Sensor busy, try again']");
+            return;
+        }
+    }
+
+    // setSamples:<1-1000>
+    if (message.startsWith("setSamples:")) {
+        long n = message.substring(11).toInt();
+        if (n < 1 || n > 1000)                         reply("['Samples limit exceeded (1-1000)']");
+        else if (!radarSendCommand(RCMD_SET_SAMPLES, (float)n)) reply("['Sensor busy, try again']");
+        return;
+    }
+
+    // setStageHeight:<1-1000>
+    if (message.startsWith("setStageHeight:")) {
+        float h = message.substring(15).toFloat();
+        if (h < 1.0f || h > 1000.0f)                   reply("['Stage height limit exceeded (1-1000)']");
+        else if (!radarSendCommand(RCMD_SET_STAGE, h)) reply("['Sensor busy, try again']");
+        return;
+    }
 
     // Data format:  set_data_format:json | set_data_format:legacy | get_data_format
     {
@@ -466,54 +377,24 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
             reply("['Data format set: %s']", f == FMT_LEGACY ? "legacy" : "json");
             return;
         }
+        if (lower.startsWith("set_stale:")) {
+            String v = lower.substring(10);
+            if (v != "on" && v != "off") { reply("['Invalid value (on|off)']"); return; }
+            showStale = (v == "on");
+            preferences.begin("device", false);
+            preferences.putBool("stale", showStale);
+            preferences.end();
+            reply("['Stale marker: %s']", showStale ? "on" : "off");
+            return;
+        }
+        if (lower == "get_stale") {
+            reply("['Stale marker: %s']", showStale ? "on" : "off");
+            return;
+        }
         if (lower == "get_data_format") {
             reply("['Data format: %s']", dataFormat == FMT_LEGACY ? "legacy" : "json");
             return;
         }
-    }
-
-    // Set Samples:  setSamples:<1-1000>
-    if (message.startsWith("setSamples:")) {
-        long n = message.substring(11).toInt();
-        if (n < 1 || n > 1000) {
-            reply("['Samples limit exceeded (1-1000)']");
-        } else if (setSamples((int)n)) {
-            reply("['Successfully set samples: %ld','Sensor: %s']", n, getSamples().c_str());
-        } else {
-            reply("['Failed to set samples']");
-        }
-        return;
-    }
-
-    // Get Samples
-    if (message == "getSamples") {
-        String v = getSamples();
-        if (v.length() && v.charAt(0) == SENSOR_ADDR) reply("['Current Samples: %s']", v.c_str());
-        else                                          reply("['Failed to get samples']");
-        return;
-    }
-
-    // Set Stage Height:  setStageHeight:<1-1000>
-    if (message.startsWith("setStageHeight:")) {
-        float h = message.substring(15).toFloat();
-        if (h < 1.0f || h > 1000.0f) {
-            reply("['Stage height limit exceeded (1-1000)']");
-        } else if (setStageHeight(h)) {
-            // setStageHeight() already read the value back from the sensor
-            reply("['Successfully set stage height: %.2f']", radarStageHeight());
-        } else {
-            reply("['Failed to set stage height']");
-        }
-        return;
-    }
-
-    // Get Stage Height
-    if (message == "getStageHeight") {
-        if (radarRefreshStageHeight() && !isnan(radarStageHeight()))
-            reply("['Current Stage Height: %.2f']", radarStageHeight());
-        else
-            reply("['Failed to get stage height']");
-        return;
     }
 
     if (message == "restart") {
@@ -522,15 +403,37 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         ESP.restart();
     }
 
+    // "data": publish the latest stored reading now (no sensor access)
     if (message == "data") {
-        SerialMon.println("MQTT Command: Data Request received");
-        // publishEnergyData();
-        Serial.println("[MAIN] Calling radar read");
-        Serial.flush();
-        readAllSensorsAndPublish();
-        Serial.println("[MAIN] Radar read done");
-        Serial.flush();
-        
+        SerialMon.println("MQTT Command: data (latest stored)");
+        if (mainTaskHandle) xTaskNotifyGive(mainTaskHandle);
+        return;
+    }
+
+    // "data_read": read the sensor now, publish when the reading is done (~3 min in low-power mode)
+    if (message == "data_read") {
+        SerialMon.println("MQTT Command: data_read");
+        sensors_requestReadAndPublish();
+        MQTTMessage r = {};
+        snprintf(r.topic, sizeof(r.topic), "%s", MQTT_PUB.c_str());
+        snprintf(r.payload, sizeof(r.payload), "['Reading sensor, data will be published when done']");
+        xQueueSend(mqttPublishQueue, &r, pdMS_TO_TICKS(100));
+        return;
+    }
+
+    // Interval query (seconds)
+    if (message == "get_interval" || message == "get_hb_interval" || message == "get_pub_interval") {
+        MQTTMessage r = {};
+        snprintf(r.topic, sizeof(r.topic), "%s", MQTT_PUB.c_str());
+        if (message == "get_hb_interval")
+            snprintf(r.payload, sizeof(r.payload), "['hb_interval:%lus']", HEARTBEAT_INTERVAL / 1000);
+        else if (message == "get_pub_interval")
+            snprintf(r.payload, sizeof(r.payload), "['pub_interval:%lus']", DATA_INTERVAL / 1000);
+        else
+            snprintf(r.payload, sizeof(r.payload), "['hb_interval:%lus','pub_interval:%lus']",
+                     HEARTBEAT_INTERVAL / 1000, DATA_INTERVAL / 1000);
+        sendLedCommand(LED_PING_ACK);
+        xQueueSend(mqttPublishQueue, &r, pdMS_TO_TICKS(100));
         return;
     }
 
@@ -745,10 +648,13 @@ void suspendAllTasks() {
     if (xSemaphoreTake(taskSuspendMutex, portMAX_DELAY)) {
         otaInProgress = true;
         tasksSuspended = true;
+        radarBusHold(true);                 // wait until no SDI-12 transaction is running
         vTaskSuspend(mainTaskHandle);
         vTaskSuspend(networkTaskHandle);
+        if (sensorTaskHandle) vTaskSuspend(sensorTaskHandle);
+        radarBusHold(false);
         xSemaphoreGive(taskSuspendMutex);
-        SerialMon.println("All tasks suspended for OTA");
+        SerialMon.println("All tasks suspended for OTA / config mode");
     }
 }
 
@@ -758,6 +664,7 @@ void resumeAllTasks() {
         tasksSuspended = false;
         vTaskResume(mainTaskHandle);
         vTaskResume(networkTaskHandle);
+        if (sensorTaskHandle) vTaskResume(sensorTaskHandle);
         xSemaphoreGive(taskSuspendMutex);
         SerialMon.println("All tasks resumed");
     }
@@ -792,153 +699,151 @@ bool parseURL(String url, String &host, String &path, int &port) {
     return true;
 }
 
+// Fetch bytes [start, start+len) with an HTTP Range request into dst.
+// Returns bytes stored (== len, except the last piece) or -1 on error.
+// `total` receives the full file size (from Content-Range).
+static int otaFetchRange(TinyGsmClient &c, const String &host, int port, const String &path,
+                         uint32_t start, uint32_t len, uint8_t *dst, uint32_t &total) {
+    c.stop();
+    if (!c.connect(host.c_str(), port)) return -1;
+
+    c.print(String("GET ") + path + " HTTP/1.1\r\nHost: " + host +
+            "\r\nUser-Agent: GMS32-OTA\r\nConnection: close\r\nRange: bytes=" +
+            start + "-" + (start + len - 1) + "\r\n\r\n");
+
+    uint32_t t0 = millis();
+    int  status = 0;
+    long contentLen = -1;
+    bool headersDone = false;
+    while (millis() - t0 < 15000 && !headersDone) {
+        if (c.available()) {
+            String line = c.readStringUntil('\n');
+            line.trim();
+            if (line.length() == 0) { headersDone = true; break; }
+            if (line.startsWith("HTTP/1."))         status = line.substring(9, 12).toInt();
+            if (line.startsWith("Content-Length:")) contentLen = line.substring(15).toInt();
+            if (line.startsWith("Content-Range:")) {
+                int slash = line.indexOf('/');
+                if (slash > 0) total = line.substring(slash + 1).toInt();
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    if (!headersDone || status != 206 || contentLen <= 0 || contentLen > (long)len) return -1;
+
+    uint32_t got = 0, lastData = millis(), lastGprsCheck = millis();
+    while (got < (uint32_t)contentLen) {
+        if (c.available()) {
+            int n = c.read(dst + got, min((uint32_t)1024, (uint32_t)contentLen - got));
+            if (n > 0) { got += n; lastData = millis(); }
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            if (millis() - lastData > 20000) return -1;
+        }
+        if (millis() - lastGprsCheck > 5000) {          // not after every read: AT traffic slows the download
+            lastGprsCheck = millis();
+            if (!modem.isGprsConnected()) return -1;
+        }
+    }
+    c.stop();
+    return (int)got;
+}
+
+// Download in pieces. Each piece is read twice and written to flash only when both
+// reads are identical, so a bad byte from the GSM link can never reach flash.
 bool performOTAUpdate() {
     SerialMon.println("\n[OTA] Starting OTA update");
 
-    String host;
-    String path;
+    String host, path;
     int port;
     if (!parseURL(firmwareUrl, host, path, port)) {
         SerialMon.println("[OTA] URL parse failed");
         return false;
     }
+    SerialMon.printf("[OTA] Host: %s  Path: %s\n", host.c_str(), path.c_str());
 
-    SerialMon.printf("[OTA] Host: %s\n", host.c_str());
-    SerialMon.printf("[OTA] Path: %s\n", path.c_str());
+    // Close MQTT first (network task is suspended; avoid broker close notices in the stream)
+    mqtt.disconnect();
+    mqttClient.stop();
+    mqttConnected = false;
+    deviceOnline  = false;
+    delay(500);
+    while (SerialAT.available()) SerialAT.read();
 
-    TinyGsmClient otaClient(modem, 1);   // mux 1: socket 0 is held by the MQTT client
-    unsigned long otaStartTime = millis();
-    const unsigned long OTA_TOTAL_TIMEOUT = 300000;
-
-    // Connect
-    SerialMon.printf("[OTA] Connecting to %s:%d\n", host.c_str(), port);
-    int connectAttempts = 0;
-    bool serverConnected = false;
-    while (connectAttempts < 3 && !serverConnected) {
-        connectAttempts++;
-        if (otaClient.connect(host.c_str(), port)) {
-            serverConnected = true;
-            SerialMon.println("[OTA] Connected to server");
-        } else {
-            SerialMon.println("[OTA] Connection failed");
-            if (connectAttempts < 3) {
-                delay(2000);
-                if (!modem.isGprsConnected()) {
-                    SerialMon.println("[OTA] GPRS lost during OTA, aborting");
-                    return false;
-                }
-            }
-        }
+    uint32_t CHUNK = 32768;
+    uint8_t *bufA = (uint8_t *)malloc(CHUNK);
+    uint8_t *bufB = (uint8_t *)malloc(CHUNK);
+    if (!bufA || !bufB) {                        // low memory: use smaller pieces
+        free(bufA); free(bufB);
+        CHUNK = 16384;
+        bufA = (uint8_t *)malloc(CHUNK);
+        bufB = (uint8_t *)malloc(CHUNK);
     }
-    if (!serverConnected) {
-        otaClient.stop();
+    if (!bufA || !bufB) {
+        SerialMon.println("[OTA] ABORT: not enough memory");
+        free(bufA); free(bufB);
         return false;
     }
 
-    // Send HTTP request
-    String request = String("GET ") + path + " HTTP/1.1\r\n" +
-                     "Host: " + host + "\r\n" +
-                     "User-Agent: GMS32-OTA\r\n" +
-                     "Connection: keep-alive\r\n\r\n";
-    otaClient.print(request);
+    TinyGsmClient otaClient(modem, 1);           // mux 1: socket 0 belongs to MQTT
+    const unsigned long otaStart = millis();
+    const unsigned long OTA_TOTAL_TIMEOUT = 3600000UL;   // 60 min
+    uint32_t total = 0, offset = 0;
+    bool began = false, ok = false;
+    int pieceRetries = 0, totalRetries = 0;
 
-    // Parse response
-    unsigned long headerTimeout = millis();
-    bool headersComplete = false;
-    int contentLength = 0;
-    bool httpOK = false;
-    while (millis() - headerTimeout < 10000 && !headersComplete) {
-        if (otaClient.available()) {
-            String line = otaClient.readStringUntil('\n');
-            line.trim();
-            if (line.length() == 0) {
-                headersComplete = true;
+    while (true) {
+        if (millis() - otaStart > OTA_TOTAL_TIMEOUT) { SerialMon.println("[OTA] ABORT: total time limit"); break; }
+        if (total && offset >= total) { ok = true; break; }
+
+        uint32_t want = total ? min(CHUNK, total - offset) : CHUNK;
+
+        int n1 = otaFetchRange(otaClient, host, port, path, offset, want, bufA, total);
+        int n2 = (n1 > 0) ? otaFetchRange(otaClient, host, port, path, offset, (uint32_t)n1, bufB, total) : -1;
+
+        if (n1 > 0 && n2 == n1 && memcmp(bufA, bufB, n1) == 0) {
+            if (!began) {
+                if (total == 0 || !Update.begin(total, U_FLASH)) {
+                    SerialMon.printf("[OTA] ABORT: Update.begin failed (%s)\n", Update.errorString());
+                    break;
+                }
+                began = true;
+                updateOtaProgress(0);
+            }
+            if (Update.write(bufA, n1) != (size_t)n1) {
+                SerialMon.printf("[OTA] ABORT: flash write failed (%s)\n", Update.errorString());
                 break;
             }
-            if (line.startsWith("HTTP/1.") && line.indexOf("200") > 0) httpOK = true;
-            if (line.startsWith("Content-Length:")) contentLength = line.substring(15).toInt();
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-    if (!headersComplete || !httpOK || contentLength <= 0) {
-        otaClient.stop();
-        return false;
-    }
-
-    if (!Update.begin(contentLength, U_FLASH)) {
-        otaClient.stop();
-        return false;
-    }
-
-    // Download and write
-    uint8_t buffer[512];
-    size_t totalWritten = 0;
-    unsigned long lastDataTime = millis();
-    unsigned long lastProgressTime = millis();
-    int lastPct = -1;
-    updateOtaProgress(0);
-    const unsigned long DATA_TIMEOUT = 60000;
-    const unsigned long PROGRESS_INTERVAL = 1000;
-
-    while (totalWritten < contentLength) {
-        if (millis() - otaStartTime > OTA_TOTAL_TIMEOUT) {
-            Update.abort();
-            otaClient.stop();
-            return false;
-        }
-        if (!modem.isGprsConnected()) {
-            Update.abort();
-            otaClient.stop();
-            return false;
-        }
-        if (otaClient.available()) {
-            lastDataTime = millis();
-            int bytesAvailable = otaClient.available();
-            int toRead = min(min(bytesAvailable, (int)sizeof(buffer)),
-                             (int)(contentLength - totalWritten));
-            if (toRead > 0) {
-                int bytesRead = otaClient.read(buffer, toRead);
-                if (bytesRead > 0) {
-                    if (Update.write(buffer, bytesRead) != bytesRead) {
-                        Update.abort();
-                        otaClient.stop();
-                        return false;
-                    }
-                    totalWritten += bytesRead;
-                    int pct = (int)((100ULL * totalWritten) / contentLength);
-                    if (pct != lastPct) {
-                        lastPct = pct;
-                        updateOtaProgress(pct);
-                    }
-                    if (millis() - lastProgressTime > PROGRESS_INTERVAL || pct == 100) {
-                        char bar[21];
-                        int filled = pct / 5;
-                        for (int i = 0; i < 20; i++) bar[i] = i < filled ? '#' : '-';
-                        bar[20] = 0;
-                        SerialMon.printf("[OTA] [%s] %3d%% (%u/%d bytes)\n",
-                                         bar, pct, (unsigned)totalWritten, contentLength);
-                        lastProgressTime = millis();
-                    }
-                }
-            }
+            offset += n1;
+            pieceRetries = 0;
+            int pct = (int)((100ULL * offset) / total);
+            updateOtaProgress(pct);
+            char bar[21];
+            for (int i = 0; i < 20; i++) bar[i] = i < pct / 5 ? '#' : '-';
+            bar[20] = 0;
+            SerialMon.printf("[OTA] [%s] %3d%% (%u/%u bytes)\n", bar, pct, (unsigned)offset, (unsigned)total);
         } else {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            if (millis() - lastDataTime > DATA_TIMEOUT) {
-                Update.abort();
-                otaClient.stop();
-                return false;
-            }
+            pieceRetries++; totalRetries++;
+            SerialMon.printf("[OTA] piece @%u mismatch/failed (n1=%d n2=%d), retry %d/6\n",
+                             (unsigned)offset, n1, n2, pieceRetries);
+            if (pieceRetries >= 6) { SerialMon.println("[OTA] ABORT: too many retries"); break; }
+            delay(1000);
         }
         esp_task_wdt_reset();
     }
 
+    free(bufA); free(bufB);
+    otaClient.stop();
+    SerialMon.printf("[OTA] pieces repeated: %d\n", totalRetries);
+
+    if (!ok) { if (began) Update.abort(); return false; }
+
     if (!Update.end() || !Update.isFinished()) {
-        otaClient.stop();
+        SerialMon.printf("[OTA] ABORT: image check failed (%s)\n", Update.errorString());
         return false;
     }
 
     SerialMon.println("[OTA] Firmware update successful!");
-    otaClient.stop();
     delay(3000);
     ESP.restart();
     return true;

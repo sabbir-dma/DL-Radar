@@ -1210,6 +1210,16 @@ async function loadSDFiles() {
 
 // ---------- Save / reset ----------
 
+// Each sensor is saved with only the settings of its own protocol.
+function configForSave() {
+    const out = JSON.parse(JSON.stringify(config));
+    (out.sensors || []).forEach(s => {
+        if (s.sensor_type === 'SDI12') delete s.modbus;
+        else delete s.sdi12;
+    });
+    return out;
+}
+
 async function saveConfig() {
     if (!config) return;
 
@@ -1234,7 +1244,7 @@ async function saveConfig() {
         const r = await fetch("/api/config", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(config)
+            body: JSON.stringify(configForSave())
         });
         const result = await r.json();
         if (!r.ok || !result.ok) throw new Error(result.message || "Save failed");
@@ -1311,4 +1321,48 @@ async function saveStage() {
     } finally {
         btn.disabled = false;
     }
+}
+
+
+// ---------- Firmware upload ----------
+
+function uploadFirmware() {
+    const file = $("fwFile").files[0];
+    if (!file) { showMessage("Choose a firmware .bin file first.", false); return; }
+    if (!file.name.endsWith(".bin")) { showMessage("File must be a .bin firmware image.", false); return; }
+    if (!confirm(`Install ${file.name} (${formatSize(file.size)})? The device will reboot.`)) return;
+
+    const btn = $("fwBtn"), wrap = $("fwProgressWrap"), bar = $("fwBar"), pct = $("fwPct");
+    btn.disabled = true;
+    wrap.style.display = "";
+    bar.style.width = "0%";
+    pct.textContent = "0%";
+
+    const fd = new FormData();
+    fd.append("firmware", file, file.name);
+
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/update");
+    xhr.upload.onprogress = (e) => {
+        if (!e.lengthComputable) return;
+        const p = Math.round(100 * e.loaded / e.total);
+        bar.style.width = p + "%";
+        pct.textContent = p + "%";
+    };
+    xhr.onload = () => {
+        let d = {};
+        try { d = JSON.parse(xhr.responseText); } catch (_) {}
+        if (xhr.status === 200 && d.ok) {
+            pct.textContent = "Installed — device is rebooting…";
+            showMessage("Firmware installed. Rebooting…");
+        } else {
+            btn.disabled = false;
+            showMessage("Update failed: " + (d.message || ("HTTP " + xhr.status)), false);
+        }
+    };
+    xhr.onerror = () => {
+        btn.disabled = false;
+        showMessage("Upload failed (connection lost).", false);
+    };
+    xhr.send(fd);
 }

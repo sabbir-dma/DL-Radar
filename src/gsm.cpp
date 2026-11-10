@@ -62,6 +62,7 @@ void GSM_setup() {
     pinMode(MODEM_PWR, OUTPUT);
     digitalWrite(MODEM_PWR, LOW);
 
+    SerialAT.setRxBufferSize(4096);      // default 256 B can overflow during OTA downloads (lost bytes -> bad image)
     SerialAT.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
     delay(1000);
 
@@ -347,7 +348,7 @@ void networkTask(void* parameter) {
                 publishHeartbeat();
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 // publishEnergyData();
-                readAllSensorsAndPublish();
+                sensors_publishLatest();        // stored data only - never block the network task
                 vTaskDelay(pdMS_TO_TICKS(100));
 
                 unsigned long lastConnectionCheck = millis();
@@ -534,28 +535,23 @@ void otaTask(void* parameter) {
 
     bool otaOk = false;
 
-    if (checkForNewFirmware()) {
-        if (xSemaphoreTake(modemMutex, portMAX_DELAY)) {
-            otaOk = performOTAUpdate();
-            xSemaphoreGive(modemMutex);
+    // The GSM link can flip a byte now and then (image check fails). Each attempt
+    // is an independent download, so retry a few times before giving up.
+    const int OTA_MAX_ATTEMPTS = 2;
+    if (checkForNewFirmware() && xSemaphoreTake(modemMutex, portMAX_DELAY)) {
+        for (int attempt = 1; attempt <= OTA_MAX_ATTEMPTS && !otaOk; attempt++) {
+            SerialMon.printf("[OTA] attempt %d/%d\n", attempt, OTA_MAX_ATTEMPTS);
+            otaOk = performOTAUpdate();      // restarts the device itself on success
+            if (!otaOk) delay(3000);
         }
+        xSemaphoreGive(modemMutex);
     }
 
-    if (!otaOk) updateOtaProgress(-1);     // failed: leave the OTA screen
-
-    if (otaOk) {
-        Serial.println("[OTA] Success, rebooting");
-        delay(1500);
-        ESP.restart();
-    }
-
-    modem.gprsDisconnect();
-    vTaskDelay(pdMS_TO_TICKS(2000));
-
-    resumeAllTasks();
-
-    otaTaskHandle = NULL;
-    vTaskDelete(NULL);
+    // Success or failure: always restart, so the device comes back in a clean state
+    Serial.println(otaOk ? "[OTA] Success, rebooting" : "[OTA] Failed, rebooting");
+    updateOtaProgress(-1);
+    delay(2000);
+    ESP.restart();
 }
 
 void createOTATask() {

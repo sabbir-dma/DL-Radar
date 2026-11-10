@@ -5,7 +5,7 @@
 #define TINY_GSM_USE_GPRS true
 #define TINY_GSM_USE_WIFI false
 #define MQTT_MAX_PACKET_SIZE 512
-#define TINY_GSM_RX_BUFFER 512
+#define TINY_GSM_RX_BUFFER 1024   // bigger reads = faster OTA download
 #define TINY_GSM_YIELD() { delay(1); }
 
 #include <Arduino.h>
