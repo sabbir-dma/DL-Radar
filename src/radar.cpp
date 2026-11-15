@@ -2,6 +2,7 @@
 #include "config.h"
 #include "display.h"
 #include "led.h"
+#include "timeutil.h"
 #include <Arduino.h>
 #include <Preferences.h>
 #include <SDI12.h>
@@ -236,6 +237,26 @@ String getStageHeight() {
   return res;
 }
 
+// D0 value currently shown on the OLED (NAN = none / error); lets the distance be recomputed
+// when the stage height changes
+static float g_shownRadarVal = NAN;
+
+// Show a stored reading on the OLED (called when the slot result is committed, same moment as
+// the SD log / publish):  distance = stage height - D0 value.  Error text / bad data -> "---".
+void radarShowReading(const char *raw) {
+    float v[RADAR_MAX_VALUES];
+    String r = raw ? raw : "";
+    if (r.length() == 0 || r.startsWith("RADAR_") ||
+        radarParseValues(r, v, RADAR_MAX_VALUES) <= RADAR_DISTANCE_FIELD) {
+        g_shownRadarVal = NAN;
+        updateDistance(NAN);
+        return;
+    }
+    g_shownRadarVal = v[RADAR_DISTANCE_FIELD];
+    if (isnan(g_stageHeight)) radarRefreshStageHeight();   // retry if boot read failed
+    updateDistance(isnan(g_stageHeight) ? NAN : g_stageHeight - g_shownRadarVal);
+}
+
 // Read stage height from the sensor and push to the display only if it changed.
 bool radarRefreshStageHeight() {
   String res = getStageHeight();
@@ -244,6 +265,7 @@ bool radarRefreshStageHeight() {
   if (isnan(g_stageHeight) || fabsf(v[0] - g_stageHeight) > 0.0005f) {
     g_stageHeight = v[0];
     updateStageHeight(g_stageHeight);
+    if (!isnan(g_shownRadarVal)) updateDistance(g_stageHeight - g_shownRadarVal);   // keep distance consistent
   }
   return true;
 }
@@ -331,92 +353,82 @@ uint32_t radarLastMeasureMs() { return g_lastMeasureMs; }
 // because a command is waiting (the sensor drops the measurement on any new command).
 static bool measureM3Once(String &rawData, bool &aborted) {
     aborted = false;
-    rawData = "";  // always reset
+    rawData = "";
 
-    // 3 measurement attempts on the stored address (no bus scan here)
-    for (int attempt = 0; attempt < 3; attempt++) {
+    // ONE attempt on the stored address. The caller (slot logic) decides about retries.
+    sdi12.clearBuffer();
+    sendCmd(String(SENSOR_ADDR) + "M3!", "Start M3");
+    String resp = readSDI12(2000);
 
-        Serial.printf("🔁 Measurement attempt %d\n", attempt + 1);
-
-        sdi12.clearBuffer();
-
-        sendCmd(String(SENSOR_ADDR) + "M3!", "Start M3");
-
-        String resp = readSDI12(2000);
-
-        if (resp.length() < 4) continue;
-
-        int t = resp.substring(1, 4).toInt();
-        if (t <= 0) t = 3;
-
-        // Wait for the sensor, in slices, so a waiting command can take the bus
-        for (int waited = 0; waited < (t + 1) * 1000; waited += 100) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            if (g_cmdPending > 0) {
-                Serial.println("[RADAR] measurement paused: command waiting");
-                aborted = true;
-                return false;
-            }
-        }
-
-        sdi12.clearBuffer();
-
-        sendCmd(String(SENSOR_ADDR) + "D0!", "Read D0");
-
-        rawData = readSDI12(2500);
-
-        Serial.println("RAW: " + rawData);
-
-        if (rawData.length() == 0) {
-            rawData = "RADAR_EMPTY";
-            continue;
-        }
-
-        int plusCount = 0;
-        for (char c : rawData) if (c == '+') plusCount++;
-
-        if (plusCount < 6) {
-            rawData = "RADAR_INVALID";
-            continue;
-        }
-
-        Serial.println("✅ Valid radar data");
-        {
-            float v[RADAR_MAX_VALUES];
-            if (radarParseValues(rawData, v, RADAR_MAX_VALUES) > RADAR_DISTANCE_FIELD) {
-                // Displayed distance = stage height - measured distance
-                if (isnan(g_stageHeight)) radarRefreshStageHeight();   // retry if boot read failed
-                updateDistance(isnan(g_stageHeight) ? NAN
-                                                    : g_stageHeight - v[RADAR_DISTANCE_FIELD]);
-            }
-        }
-        return true;
+    if (resp.length() < 4) {
+        rawData = "RADAR_NO_RESPONSE";
+        return false;
     }
 
-    if (rawData.length() == 0 || rawData.startsWith("RADAR_") == false) rawData = "RADAR_READ_ERROR";
-    return false;
+    int t = resp.substring(1, 4).toInt();
+    if (t <= 0) t = 3;
+
+    // Wait for the sensor, in slices, so a waiting command can take the bus
+    for (int waited = 0; waited < (t + 1) * 1000; waited += 100) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if (g_cmdPending > 0) {
+            Serial.println("[RADAR] measurement paused: command waiting");
+            aborted = true;
+            return false;
+        }
+    }
+
+    sdi12.clearBuffer();
+    sendCmd(String(SENSOR_ADDR) + "D0!", "Read D0");
+    rawData = readSDI12(2500);
+    Serial.println("RAW: " + rawData);
+
+    if (rawData.length() == 0) {
+        rawData = "RADAR_EMPTY";
+        return false;
+    }
+
+    int plusCount = 0;
+    for (char c : rawData) if (c == '+') plusCount++;
+    if (plusCount < 6) {
+        rawData = "RADAR_INVALID";
+        return false;
+    }
+
+    Serial.println("✅ Valid radar data");
+    return true;
 }
 
+static int g_consecFail = 0;     // failed attempts in a row (across slots)
+
+// One measurement attempt. After 3 failed attempts in a row the bus is scanned (3 tries)
+// to find the sensor address again.
 bool measureM3(String &rawData) {
     uint32_t t0 = millis();
-    bool scanned = false, ok = false;
+    Serial.printf("[RADAR] read START  %s\n", nowPretty().c_str());
 
     for (int tries = 0; tries < 3; tries++) {
-        bool aborted = false;
+        bool aborted = false, ok;
         {
             BusLock lock(false);            // measurement: not urgent
             if (!lock.ok) { rawData = "RADAR_BUSY"; return false; }
 
             ok = measureM3Once(rawData, aborted);
 
-            // 3 failed measurements -> look for the sensor (3 scans), then measure once more
-            if (!ok && !aborted && !scanned) {
-                scanned = true;
-                if (scanForSensor()) ok = measureM3Once(rawData, aborted);
+            if (!aborted) {
+                if (ok) g_consecFail = 0;
+                else if (++g_consecFail >= 3) {
+                    g_consecFail = 0;
+                    Serial.println("[RADAR] 3 failed attempts in a row -> scanning for the sensor");
+                    scanForSensor();
+                }
             }
         }                                    // bus released here
         if (!aborted) {
             if (ok) g_lastMeasureMs = millis() - t0;
+            Serial.printf("[RADAR] read END    %s  (%s, took %u s) %s\n", nowPretty().c_str(),
+                          ok ? "OK" : "FAILED", (unsigned)((millis() - t0) / 1000),
+                          ok ? "" : rawData.c_str());
             return ok;
         }
 
@@ -534,8 +546,18 @@ void radar_setup() {
       scanForSensor();
   }
 
-  getSensorInfo();
-//   setPowerLow();
+  // Sensor info + power mode: the logger needs LOW power mode, set it if it is not
+  String info = getSensorInfo();
+  Serial.println("Radar info: " + info);
+  String pm = getPowerMode();
+  if (replyIs(pm, 'L')) {
+      Serial.println("Radar power mode: LOW (ok)");
+  } else {
+      Serial.println("Radar power mode is not LOW (" + pm + ") -> setting LOW");
+      bool ok = setPowerLow();
+      pm = getPowerMode();
+      Serial.printf("Set LOW power mode: %s (now: %s)\n", ok && replyIs(pm, 'L') ? "OK" : "FAILED", pm.c_str());
+  }
   setSamples(60);
   getStageHeight();
   radarRefreshStageHeight();     // one-time read; updated again only on setStageHeight

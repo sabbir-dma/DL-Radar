@@ -10,7 +10,7 @@
 
 // ==================== Configuration ====================
 #define HW_VERSION "v1.2610.1"
-#define FW_VERSION "v1.2611.1"
+#define FW_VERSION "v1.2611.2"
 #define OTA_DATE "261109"
 //-------------------------------------------------------//
 
@@ -38,7 +38,7 @@ extern String MAC_FALLBACK_ID;
 #define MODEM_TX 17
 #define MODEM_RX 16
 #define MODEM_PWR 15
-#define ACLINE_PIN 34
+// #define ACLINE_PIN 34
 
 #define ON HIGH
 #define OFF LOW
@@ -88,6 +88,7 @@ struct MQTTMessage {
 // FMT_LEGACY : <device_id>,<raw sdi12>+<battery V>+<solar V>+<YYMMDDHHMMSS>
 enum DataFormat : uint8_t { FMT_JSON = 0, FMT_LEGACY = 1 };
 extern volatile uint8_t dataFormat;
+extern volatile uint32_t readLeadSec;   // how many seconds BEFORE the publish time the sensor reading starts (default 180)
 extern volatile bool showStale;      // add "stale":true to JSON when the previous reading is re-published (default off)
 
 // Helper function prototype

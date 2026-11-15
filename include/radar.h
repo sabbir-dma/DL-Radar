@@ -46,3 +46,4 @@ bool  radarRefreshStageHeight();
 bool radarSendCommand(RadarCmdType type, float value = 0);
 void radarBusHold(bool on);       // hold/release the SDI-12 bus (see suspendAllTasks)
 uint32_t radarLastMeasureMs();   // duration of the last good measurement (ms)
+void radarShowReading(const char *raw);   // OLED distance = stage - D0 value of this stored reading ("---" on error)

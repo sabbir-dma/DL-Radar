@@ -11,6 +11,11 @@
 
 #define DISPLAY_PIN 35
 
+// 2S battery pack: 2 x 3.2 V = 6.4 V (empty)  ..  2 x 4.2 V = 8.4 V (full)
+// #define BATT_EMPTY_V 6.4f
+#define BATT_EMPTY_V 5.0f
+#define BATT_FULL_V  8.4f
+
 extern bool buttonState;
 
 //data logger - AWS
@@ -45,6 +50,7 @@ struct DisplayData {
     int   otaPercent;        // -1 = no OTA running, else 0..100
 };
 
+extern volatile bool showBattPercent;   // show "NN%" beside the battery icon (MQTT set_battpct, saved in NVS)
 extern Adafruit_SSD1306 display;
 extern DisplayData displayData;
 extern TaskHandle_t displayTaskHandle;

@@ -16,6 +16,8 @@
 #define SD_MOSI  23
 #define SD_CS     5
 #define SOLAR_PIN 34
+#define SOLAR_MIN_V 3.0f            // solar voltage below this is shown as 0
+#define SOLAR_DIVIDER_RATIO 11.0f   // (100k + 10k) / 10k  - check against your hardware
 
 static RTC_DS3231 rtc;
 static Adafruit_INA219 ina219;
@@ -66,6 +68,7 @@ void storage_setup() {
     }
 
     pinMode(SOLAR_PIN, INPUT);
+    analogSetPinAttenuation(SOLAR_PIN, ADC_11db);   // 0..~3.1 V at the pin
 
     Serial.printf("[STORAGE] RTC=%s INA=%s SD=%s\n",
                   rtcReady ? "OK" : "FAIL",
@@ -85,6 +88,14 @@ uint32_t storage_getEpoch() {
     return now.unixtime();
 }
 
+String storage_tsFromEpoch(uint32_t e) {
+    DateTime d(e);
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%02d%02d%02d%02d%02d%02d",
+             d.year() % 100, d.month(), d.day(), d.hour(), d.minute(), d.second());
+    return String(buf);
+}
+
 String storage_getTimestamp14() {
     if (!rtcReady) return String("000000000000");
     I2CLock lk;
@@ -96,10 +107,17 @@ String storage_getTimestamp14() {
     return String(buf);
 }
 
+// GPIO34 = ADC1_CH6 (input only, fine with WiFi on). analogReadMilliVolts() applies the
+// chip's factory calibration (raw/4095*3.3 is wrong: the ADC is non-linear and full scale at
+// 11 dB is ~3.9 V). Average 16 samples to remove noise.
 float storage_getSolarVoltage() {
-    int raw = analogRead(SOLAR_PIN);
-    float vout = (raw / 4095.0f) * 3.3f;
-    return vout * (110.0f / 10.0f);
+    uint32_t mv = 0;
+    for (int i = 0; i < 16; i++) mv += analogReadMilliVolts(SOLAR_PIN);
+    float v = (mv / 16.0f) / 1000.0f * SOLAR_DIVIDER_RATIO;
+    // Below 3 V the reading is only ADC offset / noise (the ESP32 ADC reports ~0.1-0.15 V at 0 V,
+    // x11 divider = ~1.5 V): show 0.
+    if (v < SOLAR_MIN_V) return 0.0f;
+    return v;
 }
 
 float storage_getBatteryVoltage() {
@@ -113,13 +131,13 @@ int storage_getCSQ() {
     if (q < 0) return 0;
     return q;
 }
-void storage_logData(const String &sensorName, const String &rawData) {
-    if (!sdReady || !rtcReady) return;
+// Log one row stamped with ts14 (YYMMDDHHMMSS) - the row goes into that timestamp's month file
+void storage_logDataAt(const String &sensorName, const String &rawData, const String &ts14) {
+    if (!sdReady) return;
+    if (ts14.length() < 12) return;
 
-    DateTime now;
-    { I2CLock lk; now = rtc.now(); }
     char fname[32];
-    snprintf(fname, sizeof(fname), "/%04d%02d.csv", now.year(), now.month());
+    snprintf(fname, sizeof(fname), "/20%.2s%.2s.csv", ts14.c_str(), ts14.c_str() + 2);
 
     bool needHeader = !SD.exists(fname);
 
@@ -133,7 +151,6 @@ void storage_logData(const String &sensorName, const String &rawData) {
         file.println("timestamp,device_id,AOS,LOS,csq,fwv,hwv,heap,uptime,solar_voltage,battery_voltage,sensor_name,raw_data");
     }
 
-    String ts = storage_getTimestamp14();
     int csq = storage_getCSQ();
     float solar = storage_getSolarVoltage();
     float batt  = storage_getBatteryVoltage();
@@ -144,7 +161,7 @@ void storage_logData(const String &sensorName, const String &rawData) {
     safe.replace("\r", " ");
 
     file.printf("%s,%s,%s,%s,%d,%s,%s,%u,%lu,%.3f,%.3f,%s,%s\n",
-                ts.c_str(),
+                ts14.c_str(),
                 DEVICE_ID.c_str(),
                 getAOS() ? "true" : "false",
                 sdReady ? "true" : "false",
@@ -159,7 +176,11 @@ void storage_logData(const String &sensorName, const String &rawData) {
                 safe.c_str());
 
     file.close();
-    Serial.println("[SD] Data logged: " + String(fname));
+    Serial.println("[SD] Data logged: " + String(fname) + "  ts=" + ts14);
+}
+
+void storage_logData(const String &sensorName, const String &rawData) {
+    storage_logDataAt(sensorName, rawData, storage_getTimestamp14());
 }
 
 static String sendAT(const String &command, uint32_t timeout = 5000) {
@@ -185,15 +206,38 @@ bool storage_updateRTCFromNTP() {
     }
 
     Serial.println("[RTC NTP] Starting sync...");
-    sendAT("AT+CNTP=\"pool.ntp.org\",24", 5000);
-    String resp = sendAT("AT+CNTP", 60000);
-
-    if (resp.indexOf("+CNTP: 0") < 0) {
-        Serial.println("[NTP] Synchronization FAILED!");
+    String cfg = sendAT("AT+CNTP=\"pool.ntp.org\",24", 5000);
+    if (cfg.indexOf("OK") < 0) {
+        Serial.println("[NTP] Configuration FAILED!");
         return false;
     }
 
-    resp = sendAT("AT+CCLK?");
+    // "AT+CNTP" answers OK at once; the real result "+CNTP: <code>" arrives later,
+    // so keep reading until it shows up (0 = success).
+    while (SerialAT.available()) SerialAT.read();
+    SerialAT.println("AT+CNTP");
+    Serial.println("[NTP] Requesting time...");
+
+    String result;
+    bool ntpOk = false;
+    uint32_t t0 = millis();
+    while (millis() - t0 < 40000) {
+        while (SerialAT.available()) result += (char)SerialAT.read();
+        int p = result.indexOf("+CNTP:");
+        if (p >= 0 && result.indexOf('\n', p) >= 0) {          // full result line received
+            ntpOk = (result.indexOf("+CNTP: 0", p) >= 0);
+            break;
+        }
+        if (result.indexOf("ERROR") >= 0) break;
+        delay(20);
+    }
+    if (!ntpOk) {
+        Serial.printf("[NTP] Synchronization FAILED! (%s)\n", result.c_str());
+        return false;
+    }
+    Serial.println("[NTP] Synchronization successful.");
+
+    String resp = sendAT("AT+CCLK?");
     char *pos = strstr(resp.c_str(), "+CCLK: \"");
     if (!pos) {
         Serial.println("[NTP] Cannot read modem clock!");
@@ -220,23 +264,67 @@ bool storage_updateRTCFromNTP() {
     return true;
 }
 
+// ---------------- RTC sync scheduling ----------------
+static volatile bool ntpPending     = false;
+static volatile bool ntpReplyMqtt   = false;
+static uint32_t      lastSyncDayKey = 0;      // yyyymmdd of the last successful sync
+static uint32_t      ntpNextTryMs   = 0;
+
+static void mqttReply(const char *text) {
+    if (!mqttPublishQueue) return;
+    MQTTMessage r = {};
+    snprintf(r.topic, sizeof(r.topic), "%s", MQTT_PUB.c_str());
+    snprintf(r.payload, sizeof(r.payload), "%s", text);
+    xQueueSend(mqttPublishQueue, &r, pdMS_TO_TICKS(100));
+}
+
+void storage_requestNtpSync(bool replyOverMqtt) {
+    if (replyOverMqtt) ntpReplyMqtt = true;
+    ntpPending = true;
+    ntpNextTryMs = 0;
+}
+
+bool storage_ntpPending() { return ntpPending; }
+
+// Runs in the NetworkTask (modem owner) while online
+void storage_serviceNtp() {
+    if (!ntpPending || millis() < ntpNextTryMs) return;
+
+    bool ok = storage_updateRTCFromNTP();
+    char buf[96];
+    if (ok) {
+        ntpPending = false;
+        DateTime n; { I2CLock lk; n = rtc.now(); }
+        lastSyncDayKey = n.year() * 10000UL + n.month() * 100UL + n.day();
+        snprintf(buf, sizeof(buf), "['RTC synced from NTP: %s']", storage_getTimestamp14().c_str());
+    } else {
+        ntpNextTryMs = millis() + 600000UL;       // retry in 10 min
+        snprintf(buf, sizeof(buf), "['RTC NTP sync failed, will retry']");
+    }
+    if (ntpReplyMqtt) { ntpReplyMqtt = false; mqttReply(buf); }
+}
+
+bool storage_setRtc(const char *ts12) {
+    if (!rtcReady || !ts12 || strlen(ts12) != 12) return false;
+    for (int i = 0; i < 12; i++) if (ts12[i] < '0' || ts12[i] > '9') return false;
+    auto two = [&](int i) { return (ts12[i] - '0') * 10 + (ts12[i + 1] - '0'); };
+    int yy = two(0), mo = two(2), dd = two(4), hh = two(6), mi = two(8), ss = two(10);
+    if (mo < 1 || mo > 12 || dd < 1 || dd > 31 || hh > 23 || mi > 59 || ss > 59) return false;
+    { I2CLock lk; rtc.adjust(DateTime(2000 + yy, mo, dd, hh, mi, ss)); }
+    lastSyncDayKey = 0;           // manual set: still do the automatic NTP sync when possible
+    return true;
+}
+
+// Called about once a second from loop(): schedules the daily sync
 void storage_handlePeriodic() {
     if (!rtcReady) return;
 
     DateTime now;
     { I2CLock lk; now = rtc.now(); }
+    uint32_t dayKey = now.year() * 10000UL + now.month() * 100UL + now.day();
 
-    if (now.hour() == 0 && now.minute() == 0 && now.second() == 1) {
-        static uint32_t lastSyncDay = 0;
-
-        uint32_t dateKey =
-            now.year() * 1000UL +
-            now.month() * 32UL +
-            now.day();
-
-        if (lastSyncDay != dateKey) {
-            lastSyncDay = dateKey;
-            storage_updateRTCFromNTP();
-        }
+    // New day (or never synced since boot): ask for a sync, the NetworkTask does it when online
+    if (dayKey != lastSyncDayKey && !ntpPending && millis() >= ntpNextTryMs) {
+        ntpPending = true;
     }
 }

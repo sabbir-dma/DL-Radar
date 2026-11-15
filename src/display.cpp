@@ -25,6 +25,8 @@ Adafruit_SSD1306 display(
     OLED_CS
 );
 
+volatile bool showBattPercent = true;
+
 DisplayData displayData = {
     NAN,      // distance
     NAN,      // stage
@@ -42,23 +44,12 @@ QueueHandle_t displayCommandQueue = NULL;
 // ============================================================
 // Helper functions (static to avoid external linkage)
 // ============================================================
-// Battery voltage -> percent (piecewise-linear over the discharge table)
+// Battery voltage -> percent for the 2S pack (BATT_EMPTY_V .. BATT_FULL_V), clamped 0..100
 static int batteryPercentFromVoltage(float v) {
-    static const float TBL[][2] = {
-        {7.2f, 100}, {7.0f, 99}, {6.8f, 90}, {6.6f, 80}, {6.5f, 70}, {6.4f, 60},
-        {6.3f, 50},  {6.2f, 40}, {6.1f, 30}, {6.0f, 20}, {5.8f, 10}, {5.5f, 5},
-        {5.2f, 0}
-    };
-    const int N = sizeof(TBL) / sizeof(TBL[0]);
-    if (v >= TBL[0][0])   return 100;
-    if (v <= TBL[N-1][0]) return 0;
-    for (int i = 0; i < N - 1; i++) {
-        if (v <= TBL[i][0] && v > TBL[i+1][0]) {
-            float frac = (v - TBL[i+1][0]) / (TBL[i][0] - TBL[i+1][0]);
-            return (int)(TBL[i+1][1] + frac * (TBL[i][1] - TBL[i+1][1]) + 0.5f);
-        }
-    }
-    return 0;
+    float pct = (v - BATT_EMPTY_V) * 100.0f / (BATT_FULL_V - BATT_EMPTY_V);
+    if (pct < 0)   pct = 0;
+    if (pct > 100) pct = 100;
+    return (int)(pct + 0.5f);
 }
 
 static void drawBatteryIcon(int percent) {
@@ -244,11 +235,13 @@ static void displayHomePage() {
     drawSignalBars(displayData.signalLevel);
 
     // Percentage beside the battery icon
-    char pct[8];
-    if (displayData.batteryPercent < 0) snprintf(pct, sizeof(pct), "--%%");
-    else                                snprintf(pct, sizeof(pct), "%d%%", displayData.batteryPercent);
-    display.setCursor(23, 1);
-    display.print(pct);
+    if (showBattPercent) {
+        char pct[8];
+        if (displayData.batteryPercent < 0) snprintf(pct, sizeof(pct), "--%%");
+        else                                snprintf(pct, sizeof(pct), "%d%%", displayData.batteryPercent);
+        display.setCursor(23, 1);
+        display.print(pct);
+    }
 
     const char* title = "DMA_AWLG";
     display.setCursor(54, 1);          // right of "100%", left of the signal bars

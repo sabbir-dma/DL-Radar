@@ -539,6 +539,7 @@ void handleSetStage() {
 // ---------- Firmware upload (full image, from the portal) ----------
 // Upload build output "firmware.bin" (app image). Device reboots when done.
 
+static volatile bool fwUploadBusy = false;   // keeps config mode open during a firmware upload
 static String fwErr;
 static bool   fwOk = false;
 static bool   fwFirst = true;
@@ -548,7 +549,7 @@ void handleFirmwareUpload() {
     HTTPUpload &up = server.upload();
 
     if (up.status == UPLOAD_FILE_START) {
-        fwErr = ""; fwOk = false; fwFirst = true; fwLastPct = -1;
+        fwErr = ""; fwOk = false; fwFirst = true; fwLastPct = -1; fwUploadBusy = true;
         Serial.printf("[FW] upload start: %s\n", up.filename.c_str());
         if (!up.filename.endsWith(".bin")) { fwErr = "Select a .bin firmware file"; return; }
         if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) { fwErr = Update.errorString(); return; }
@@ -581,11 +582,13 @@ void handleFirmwareUpload() {
         }
 
     } else if (up.status == UPLOAD_FILE_END) {
+        fwUploadBusy = false;
         if (fwErr.length()) return;
         if (Update.end(true)) { fwOk = true; updateOtaProgress(100); Serial.printf("[FW] done, %u bytes\n", (unsigned)up.totalSize); }
         else                  fwErr = Update.errorString();
 
     } else if (up.status == UPLOAD_FILE_ABORTED) {
+        fwUploadBusy = false;
         Update.abort();
         fwErr = "Upload aborted";
     }
@@ -718,7 +721,7 @@ void handleSDStatus() {
     doc["ready"] = storage_sd_ready();
     sendJson(200, doc);
 }
-void setupWebServer()
+static void registerRoutes()
 {
     server.on("/",          HTTP_GET, [](){ serveFile("/index.html", "text/html"); });
     server.on("/style.css", HTTP_GET, [](){ serveFile("/style.css",  "text/css"); });
@@ -741,6 +744,12 @@ void setupWebServer()
     server.on("/api/sd/status",   HTTP_GET,  handleSDStatus);
 
     server.onNotFound(handleNotFound);
+}
+
+void setupWebServer()
+{
+    static bool routesDone = false;
+    if (!routesDone) { registerRoutes(); routesDone = true; }
     server.begin();
     Serial.println("HTTP server started.");
 }

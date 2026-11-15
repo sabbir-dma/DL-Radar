@@ -1,6 +1,7 @@
 #include "gsm.h"
 // #include "energy_meter.h"
 #include "sensors.h"
+#include "storage.h"
 //These Function is gsm.h property I have redeclared it
 void publishHeartbeat();
 //=================================
@@ -347,9 +348,6 @@ void networkTask(void* parameter) {
                 // Send initial heartbeat + energy data
                 publishHeartbeat();
                 vTaskDelay(pdMS_TO_TICKS(1000));
-                // publishEnergyData();
-                sensors_publishLatest();        // stored data only - never block the network task
-                vTaskDelay(pdMS_TO_TICKS(100));
 
                 unsigned long lastConnectionCheck = millis();
                 unsigned long lastKeepalive = millis();
@@ -378,6 +376,14 @@ void networkTask(void* parameter) {
                         mqttConnected = false;
                         deviceOnline = false;
                         break;
+                    }
+
+                    // ---- 2b. RTC sync (daily / on request) - network task owns the modem ----
+                    if (storage_ntpPending()) {
+                        if (xSemaphoreTake(mqttMutex, pdMS_TO_TICKS(2000))) {
+                            storage_serviceNtp();
+                            xSemaphoreGive(mqttMutex);
+                        }
                     }
 
                     // ---- 3. Drain ONE message from queue ----

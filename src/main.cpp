@@ -17,7 +17,12 @@ Preferences preferences;
 unsigned long HEARTBEAT_INTERVAL;
 unsigned long DATA_INTERVAL;
 volatile uint8_t dataFormat = FMT_LEGACY;
+volatile uint32_t readLeadSec = 180;
 volatile bool showStale = false;
+
+static unsigned long portalStartMs = 0;
+#define PORTAL_TIMEOUT_MS (10UL * 60UL * 1000UL)     // config mode closes after 10 min
+static void closeConfigMode();
 
 // ==================== Setup ====================
 void setup() {
@@ -36,7 +41,7 @@ void setup() {
     
     sendLedCommand(LED_OFFLINE);
 
-    pinMode(ACLINE_PIN, INPUT);  
+    // pinMode(ACLINE_PIN, INPUT);  
     
     // Get MAC address for fallback ID
     MAC_FALLBACK_ID = getMACDeviceID();
@@ -71,6 +76,14 @@ void setup() {
         preferences.end();
     #endif
 
+    {   // publish interval must be 5/10/15/20/30 min (slots are minute % interval == 0)
+        unsigned long m = DATA_INTERVAL / 60000UL;
+        if (DATA_INTERVAL % 60000UL != 0 || !(m == 5 || m == 10 || m == 15 || m == 20 || m == 30)) {
+            SerialMon.printf("Stored pub interval %lu ms not allowed -> 5 min\n", DATA_INTERVAL);
+            DATA_INTERVAL = 300000UL;
+        }
+    }
+
     preferences.begin("device", true);
     dataFormat = preferences.getUChar("dfmt", FMT_JSON) == FMT_LEGACY ? FMT_LEGACY : FMT_JSON;
     preferences.end();
@@ -79,6 +92,15 @@ void setup() {
     showStale = preferences.getBool("stale", false);
     preferences.end();
     SerialMon.printf("Stale marker: %s\n", showStale ? "on" : "off");
+    preferences.begin("device", true);
+    showBattPercent = preferences.getBool("battpct", true);
+    preferences.end();
+    SerialMon.printf("Battery %% on display: %s\n", showBattPercent ? "on" : "off");
+    preferences.begin("device", true);
+    readLeadSec = preferences.getULong("lead", 180);
+    preferences.end();
+    if (readLeadSec < 60 || readLeadSec > 600) readLeadSec = 180;
+    SerialMon.printf("Read lead time: %u s\n", (unsigned)readLeadSec);
 
     SerialMon.println("Final Device ID: " + DEVICE_ID);
     SerialMon.println("=================================\n");
@@ -140,6 +162,7 @@ void loop() {
     if (softAP_started) {
         server.handleClient();
         vTaskDelay(pdMS_TO_TICKS(2));
+        if (!fwUploadBusy && millis() - portalStartMs > PORTAL_TIMEOUT_MS) closeConfigMode();
     } else {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
@@ -151,19 +174,8 @@ void mainTask(void* parameter) {
 
     SerialMon.println("Main Task started");
     updateVoltages(storage_getBatteryVoltage(), storage_getSolarVoltage());
-    updateBatteryPercentage(100);  // Initialize battery percentage to 100% at startup
 
-    // Publish times are multiples of DATA_INTERVAL on the (RTC) clock.
-    // The SensorTask has the reading ready ~3.5 min before; here we only send what is stored.
-    auto slotOf = []() -> uint32_t {
-        uint32_t iv = DATA_INTERVAL / 1000;
-        if (iv < 30) iv = 30;
-        return (sensors_scheduleNow() / iv) * iv;
-    };
-    uint32_t lastPubSlot = slotOf();       // no publish at boot; first one at the next boundary
-    bool     pendingPub  = false;          // slot reached while offline -> retry briefly
-    uint32_t pendingSince = 0;
-
+    // Data reading / SD logging / publishing at the exact slot times is done by SensorTask.
     while (1) {
         if (otaInProgress) {
             vTaskDelay(pdMS_TO_TICKS(1000));
@@ -181,27 +193,6 @@ void mainTask(void* parameter) {
             }
         }
 
-        // Exact-time data publish
-        uint32_t cur = slotOf();
-        if (cur < lastPubSlot) lastPubSlot = cur;            // clock moved back
-        if (cur > lastPubSlot) {
-            lastPubSlot = cur;
-            pendingPub = true;
-            pendingSince = sensors_scheduleNow();
-        }
-        if (pendingPub) {
-            if (deviceOnline) {
-                SerialMon.println("Publishing latest data...");
-                sensors_publishLatest();
-                updateVoltages(storage_getBatteryVoltage(), storage_getSolarVoltage());
-                updateBatteryPercentage((int)((storage_getBatteryVoltage() / 7.4) * 100));
-                pendingPub = false;
-            } else if (sensors_scheduleNow() - pendingSince > 90) {
-                SerialMon.println("Offline at publish time - skipped (data is on the SD card)");
-                pendingPub = false;
-            }
-        }
-
         // MQTT "data": publish the stored latest data right now
         if (ulTaskNotifyTake(pdTRUE, 0) > 0) {
             sensors_publishLatest();
@@ -212,6 +203,7 @@ void mainTask(void* parameter) {
 }
 
 void dev_config() {
+    if (softAP_started) return;                       // already open
     // displayConfigPage();
     WiFi.mode(WIFI_AP);
     if (!WiFi.softAP(AP_SSID, AP_PASSWORD)) {
@@ -226,7 +218,21 @@ void dev_config() {
 
         setupWebServer();
         softAP_started = true;
+        portalStartMs = millis();
         suspendAllTasks();
+}
+
+// Close config mode (user forgot to close it): stop WiFi + web server, resume normal work
+static void closeConfigMode() {
+    Serial.println("[PORTAL] 10 min elapsed - closing config mode");
+    server.stop();
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_OFF);
+    softAP_started = false;
+    resumeAllTasks();
+    sendDisplayCommand(DISPLAY_UPDATE_HOME);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    ESP.restart();
 }
 
 //========================================================
@@ -281,27 +287,24 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     }
 
     if (message.startsWith("set_pub_interval:")) {
-        unsigned long newInterval = message.substring(17).toInt();
-
-        if (newInterval >= 240 && newInterval <= 3600) {
-            newInterval = newInterval * 1000;
+        unsigned long sec = message.substring(17).toInt();     // seconds
+        // minute % interval == 0 slots: 5 / 10 / 15 / 20 / 30 min
+        if (sec == 300 || sec == 600 || sec == 900 || sec == 1200 || sec == 1800) {
+            unsigned long ms = sec * 1000UL;
             preferences.begin("device", false);
-            preferences.putULong("dt_inv", newInterval);
+            preferences.putULong("dt_inv", ms);
             preferences.end();
-            DATA_INTERVAL = newInterval;
+            DATA_INTERVAL = ms;
 
-            MQTTMessage response = {};     // ← zeroes retries
+            MQTTMessage response = {};
             snprintf(response.topic, sizeof(response.topic), "%s", MQTT_PUB.c_str());
-            snprintf(response.payload, sizeof(response.payload), "['Successfully set limit: %s']", String(newInterval).c_str());
+            snprintf(response.payload, sizeof(response.payload), "['Successfully set pub interval: %lu s']", sec);
             sendLedCommand(LED_PING_ACK);
             xQueueSend(mqttPublishQueue, &response, pdMS_TO_TICKS(100));
-            // ESP.restart();
-        }
-        else {
-            Serial.println("interval time limit exceeded! [240-3600]");
-            MQTTMessage response2 = {};     // ← zeroes retries
+        } else {
+            MQTTMessage response2 = {};
             snprintf(response2.topic, sizeof(response2.topic), "%s", MQTT_PUB.c_str());
-            snprintf(response2.payload, sizeof(response2.payload), "['limit exceeded (240-3600)']");
+            snprintf(response2.payload, sizeof(response2.payload), "['Allowed pub interval (s): 300, 600, 900, 1200, 1800']");
             sendLedCommand(LED_PING_ACK);
             xQueueSend(mqttPublishQueue, &response2, pdMS_TO_TICKS(100));
         }
@@ -377,6 +380,35 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
             reply("['Data format set: %s']", f == FMT_LEGACY ? "legacy" : "json");
             return;
         }
+        if (lower.startsWith("set_read_lead:")) {
+            long sec = lower.substring(14).toInt();
+            if (sec < 60 || sec > 600) { reply("['Allowed read lead: 60-600 s']"); return; }
+            readLeadSec = (uint32_t)sec;
+            preferences.begin("device", false);
+            preferences.putULong("lead", readLeadSec);
+            preferences.end();
+            reply("['Read starts %lu s before publish time']", (unsigned long)readLeadSec);
+            return;
+        }
+        if (lower == "get_read_lead") {
+            reply("['Read starts %lu s before publish time']", (unsigned long)readLeadSec);
+            return;
+        }
+        if (lower.startsWith("set_battpct:")) {
+            String v = lower.substring(12);
+            if (v != "on" && v != "off") { reply("['Invalid value (on|off)']"); return; }
+            showBattPercent = (v == "on");
+            preferences.begin("device", false);
+            preferences.putBool("battpct", showBattPercent);
+            preferences.end();
+            sendDisplayCommand(DISPLAY_UPDATE_HOME);
+            reply("['Battery percentage on display: %s']", showBattPercent ? "on" : "off");
+            return;
+        }
+        if (lower == "get_battpct") {
+            reply("['Battery percentage on display: %s']", showBattPercent ? "on" : "off");
+            return;
+        }
         if (lower.startsWith("set_stale:")) {
             String v = lower.substring(10);
             if (v != "on" && v != "off") { reply("['Invalid value (on|off)']"); return; }
@@ -395,6 +427,62 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
             reply("['Data format: %s']", dataFormat == FMT_LEGACY ? "legacy" : "json");
             return;
         }
+    }
+
+    // ---- help: example get / set commands ----
+    if (message == "help" || message == "?") {
+        reply("['GET: get_info, get_interval, get_hb_interval, get_pub_interval, get_data_format, get_stale, get_battpct, get_read_lead, get_rtc, getSamples, getStageHeight, getPowerMode, getUnit, get_sim_info']");
+        reply("['SET: set_hb_interval:300 (15-600 s), set_pub_interval:300 (300|600|900|1200|1800 s), set_data_format:json|legacy, set_stale:on|off, set_battpct:on|off, set_read_lead:180 (60-600 s), set_rtc:261111153000 (YYMMDDHHMMSS)']");
+        reply("['SENSOR: setStageHeight:5.0 (1-1000), setSamples:60 (1-1000), setPowerLow, setPowerHigh, setUnitMeters, setUnitFeets, factoryReset']");
+        reply("['ACTION: ping (heartbeat), data (latest stored), data_read (read sensor now), rtc_sync (NTP), wifi_ap, arm:1|0, ota <url>, restart']");
+        return;
+    }
+
+    // ---- get_info: device summary ----
+    if (message == "get_info" || message == "get_config") {
+        MQTTMessage r = {};
+        snprintf(r.topic, sizeof(r.topic), "%s", MQTT_PUB.c_str());
+        int n = snprintf(r.payload, sizeof(r.payload),
+            "{\"device_id\":\"%s\",\"fw\":\"%s\",\"hw\":\"%s\",\"hb_s\":%lu,\"pub_s\":%lu,"
+            "\"format\":\"%s\",\"stale\":%s,\"armed\":%s,\"rtc\":\"%s\",\"sd\":%s,"
+            "\"batt_v\":%.2f,\"solar_v\":%.2f,\"csq\":%d,\"heap\":%u,\"uptime_min\":%lu,"
+            "\"sdi12_addr\":\"%c\",\"stage\":%.2f,\"sensors\":[",
+            DEVICE_ID.c_str(), FW_VERSION, HW_VERSION,
+            HEARTBEAT_INTERVAL / 1000, DATA_INTERVAL / 1000,
+            dataFormat == FMT_LEGACY ? "legacy" : "json", showStale ? "true" : "false",
+            deviceArmed ? "true" : "false", storage_getTimestamp14().c_str(),
+            storage_sd_ready() ? "true" : "false",
+            storage_getBatteryVoltage(), storage_getSolarVoltage(),
+            (int)modem.getSignalQuality(), (unsigned)ESP.getFreeHeap(), (unsigned long)(millis() / 60000),
+            SENSOR_ADDR, isnan(radarStageHeight()) ? -1.0f : radarStageHeight());
+        bool firstS = true;
+        for (JsonObject sn : config["sensors"].as<JsonArray>()) {
+            if (n >= (int)sizeof(r.payload) - 80) break;
+            n += snprintf(r.payload + n, sizeof(r.payload) - n, "%s{\"id\":%d,\"name\":\"%s\",\"type\":\"%s\"}",
+                          firstS ? "" : ",", (int)(sn["id"] | 0), (const char *)(sn["name"] | "?"),
+                          (const char *)(sn["sensor_type"] | sn["type"] | "?"));
+            firstS = false;
+        }
+        snprintf(r.payload + n, sizeof(r.payload) - n, "]}");
+        sendLedCommand(LED_PING_ACK);
+        xQueueSend(mqttPublishQueue, &r, pdMS_TO_TICKS(100));
+        return;
+    }
+
+    // ---- RTC ----
+    if (message == "get_rtc") {
+        reply("['RTC: %s']", storage_getTimestamp14().c_str());
+        return;
+    }
+    if (message == "rtc_sync") {
+        storage_requestNtpSync(true);               // NetworkTask runs it and replies
+        reply("['RTC NTP sync requested']");
+        return;
+    }
+    if (message.startsWith("set_rtc:")) {
+        if (storage_setRtc(message.substring(8).c_str())) reply("['RTC set: %s']", storage_getTimestamp14().c_str());
+        else                                               reply("['Invalid time, use set_rtc:YYMMDDHHMMSS']");
+        return;
     }
 
     if (message == "restart") {
@@ -576,7 +664,8 @@ void publishHeartbeat() {
     int     minHeap  = ESP.getMinFreeHeap();
     int     uptime_m = millis() / 60000;
 
-    bool acLine = digitalRead(ACLINE_PIN) == HIGH;
+    // bool acLine = digitalRead(ACLINE_PIN) == HIGH;
+    bool acLine = LOW;
 
     float solarV = storage_getSolarVoltage();
     float battV  = storage_getBatteryVoltage();
@@ -586,12 +675,24 @@ void publishHeartbeat() {
 
     //Update Display Sigal Strength
     updateSignalStrength(signalLevel);
-    updateVoltages(battV, solarV);
 
     // MQTTMessage hbMsg;
     MQTTMessage hbMsg = {};     // ← zeroes retries
 
-    int len = snprintf(hbMsg.payload, sizeof(hbMsg.payload),
+    int len;
+    if (dataFormat == FMT_LEGACY) {
+        // device_id,FWV:_,HWV:_,ARMED:_,DATA_TYPE:gsm,AC_LINE:_,SD_LOGING:_,HEALTH:_,UP_TIME:_Min,RSSI:_
+        len = snprintf(hbMsg.payload, sizeof(hbMsg.payload),
+            "%s,FWV:%s,HWV:%s,ARMED:%d,DATA_TYPE:gsm,AC_LINE:%d,SD_LOGING:%d,HEALTH:%d,UP_TIME:%dMin,RSSI:%d",
+            DEVICE_ID.c_str(), FW_VERSION, HW_VERSION,
+            deviceArmed ? 1 : 0,
+            acLine ? 1 : 0,
+            storage_sd_ready() ? 1 : 0,
+            heap,
+            uptime_m,
+            (int)csq);
+    } else {
+        len = snprintf(hbMsg.payload, sizeof(hbMsg.payload),
         "{"
             "\"device_id\":\"%s\","
             "\"type\":\"heartbeat\","
@@ -625,14 +726,15 @@ void publishHeartbeat() {
         temperatureRead(),
         solarV,
         battV
-    );
+        );
+    }
 
     if (len < 0 || len >= (int)sizeof(hbMsg.payload)) {
         SerialMon.println("Heartbeat: payload truncated!");
         return;
     }
 
-    snprintf(hbMsg.topic, sizeof(hbMsg.topic), "%s", MQTT_PUB.c_str());
+    snprintf(hbMsg.topic, sizeof(hbMsg.topic), "%s", MQTT_HB.c_str());   // heartbeat has its own topic
 
     SerialMon.println(hbMsg.payload);
 

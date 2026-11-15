@@ -44,28 +44,51 @@ void appendChannelError(ChannelWriter &w,
 }
 
 // ============================================================
-// Latest readings
+// Readings, schedule, SD log, publish
 // ------------------------------------------------------------
-// Acquisition (reading + SD logging) runs on its own schedule and always keeps
-// the newest result per sensor in `slots`.  Publishing just sends what is stored,
-// so it happens at the exact interval even if the sensor is slow or failing.
+// Publish "slots" are the clock times where minute % interval == 0 (interval 5/10/15/20/30 min).
+// For every slot S:
+//   * reading starts LEAD seconds before S (3 min, longer if the sensor needs longer)
+//   * up to 2 attempts per sensor
+//   * result is logged to SD and published with the timestamp of S (exactly at S, or right
+//     away if the reading finished after S)
+//   * failed slot: previous good reading is re-used ONCE; if the previous slot also failed,
+//     the real error text is logged / published instead
 // ============================================================
-#define MAX_SLOTS   12
+#define MAX_SLOTS   6
 #define SLOT_CH     700
 
 struct SensorSlot {
     bool  used;
-    bool  everRead;          // at least one good reading stored
-    bool  lastOk;            // newest attempt succeeded (false => published data is stale)
     int   id;
     char  name[32];
     char  type[16];
-    char  ts[16];            // YYMMDDHHMMSS of the stored reading
-    char  channels[SLOT_CH]; // JSON channel list text
+    // newest slot result (what SD got / what is published)
+    bool  valid;
+    bool  stale;             // copy of the previous reading (read failed this slot)
+    char  ts[16];            // YYMMDDHHMMSS (slot time)
+    char  channels[SLOT_CH];
+    char  raw[256];
+    float batt, solar;
+    // last GOOD reading
+    bool  haveGood;
+    bool  fromGood;          // `channels/raw` above are (a copy of) the last good reading
+    uint8_t gPubCount;       // how many times the last good reading was published (max 2)
+    char  gChannels[SLOT_CH];
+    char  gRaw[256];
+    float gBatt, gSolar;
+};
+static SensorSlot slots[MAX_SLOTS];
+
+// result of one read pass (all sensors)
+struct ReadRes {
+    bool  used, ok;
+    char  channels[SLOT_CH];
     char  raw[256];
     float batt, solar;
 };
-static SensorSlot slots[MAX_SLOTS];
+static ReadRes results[MAX_SLOTS];
+
 static SemaphoreHandle_t slotMutex = NULL;
 TaskHandle_t sensorTaskHandle = NULL;
 extern unsigned long DATA_INTERVAL;           // ms, defined in main.cpp
@@ -75,7 +98,7 @@ void initSensors() {
     Serial.println("[SENSORS] Dispatcher initialized");
 }
 
-// Time base for the schedule: RTC epoch if valid, else uptime
+// Time base: RTC epoch if valid, else uptime
 uint32_t sensors_scheduleNow() {
     uint32_t e = storage_getEpoch();
     return e ? e : (uint32_t)(millis() / 1000);
@@ -87,14 +110,17 @@ static void lowerCopy(char *dst, size_t n, const char *src) {
     dst[i] = 0;
 }
 
-// ---- read every enabled sensor, store the result, log to SD ----
-void sensors_acquire() {
-    Serial.println("[SENSORS] --- acquire ---");
-    if (!slotMutex) return;
+static void copyStr(char *dst, size_t n, const char *src) {
+    strncpy(dst, src, n - 1);
+    dst[n - 1] = 0;
+}
 
-    static char chBuf[SLOT_CH];
+// ---- read every enabled sensor (max 2 attempts each) into results[] ----
+static void readAllSensors() {
     JsonArray sensors = config["sensors"];
+    static char chBuf[SLOT_CH];
     int idx = 0;
+    memset(results, 0, sizeof(results));
 
     for (JsonObject sensor : sensors) {
         if (idx >= MAX_SLOTS) break;
@@ -105,54 +131,37 @@ void sensors_acquire() {
         lowerCopy(type, sizeof(type), sensor["type"] | sensor["sensor_type"] | "modbus");
         const char *name = sensor["name"] | "Unknown";
         int id = sensor["id"] | 0;
+        bool isSdi = (strcmp(type, "sdi12") == 0 || strcmp(type, "sdi-12") == 0 || strcmp(type, "radar") == 0);
+        bool isMod = (strcmp(type, "modbus") == 0);
+        if (!isSdi && !isMod) { Serial.printf("[SENSORS] Unknown type: %s\n", type); continue; }
 
-        Serial.printf("[SENSORS] Reading: %s (id=%d, type=%s)\n", name, id, type);
-
-        chBuf[0] = 0;
-        ChannelWriter w = { .buf = chBuf, .bufSize = sizeof(chBuf), .len = 0,
-                            .first = true, .anyOk = false, .raw = {0} };
-
-        bool ok = false;
-        if (strcmp(type, "modbus") == 0) {
-            ok = readModbusSensor(sensor, w);
-        } else if (strcmp(type, "sdi12") == 0 || strcmp(type, "sdi-12") == 0 || strcmp(type, "radar") == 0) {
-            ok = readSDI12Sensor(sensor, w);
-        } else {
-            Serial.printf("[SENSORS] Unknown type: %s\n", type);
-            continue;
-        }
-
-        String ts = getTimestamp14();
-        float batt = storage_getBatteryVoltage();
-        float solar = storage_getSolarVoltage();
-
+        // fixed info
         xSemaphoreTake(slotMutex, portMAX_DELAY);
         SensorSlot &sl = slots[si];
         sl.used = true;
         sl.id = id;
-        strncpy(sl.name, name, sizeof(sl.name) - 1);
-        strncpy(sl.type, type, sizeof(sl.type) - 1);
-        if (ok || !sl.everRead) {
-            // good reading, or nothing good stored yet (keep the error text so something is published)
-            strncpy(sl.channels, chBuf, sizeof(sl.channels) - 1);
-            strncpy(sl.raw, w.raw, sizeof(sl.raw) - 1);
-            strncpy(sl.ts, ts.c_str(), sizeof(sl.ts) - 1);
-            sl.batt = batt;
-            sl.solar = solar;
-            if (ok) sl.everRead = true;
-        }
-        sl.lastOk = ok;
+        copyStr(sl.name, sizeof(sl.name), name);
+        copyStr(sl.type, sizeof(sl.type), type);
         xSemaphoreGive(slotMutex);
 
-        if (!ok) Serial.println("[SENSORS] read FAILED -> previous reading stays as latest");
-
-        // SD logging happens here, always - independent of network state
-        storage_logData(String(name), String(w.raw));
+        ReadRes &r = results[si];
+        r.used = true;
+        for (int attempt = 1; attempt <= 2 && !r.ok; attempt++) {
+            Serial.printf("[SENSORS] %s attempt %d/2\n", name, attempt);
+            chBuf[0] = 0;
+            ChannelWriter w = { .buf = chBuf, .bufSize = sizeof(chBuf), .len = 0,
+                                .first = true, .anyOk = false, .raw = {0} };
+            r.ok = isSdi ? readSDI12Sensor(sensor, w) : readModbusSensor(sensor, w);
+            copyStr(r.channels, sizeof(r.channels), chBuf);
+            copyStr(r.raw, sizeof(r.raw), w.raw);
+            if (!r.ok) Serial.printf("[SENSORS] %s attempt %d failed: %s\n", name, attempt, r.raw);
+        }
+        r.batt = storage_getBatteryVoltage();
+        r.solar = storage_getSolarVoltage();
     }
-    Serial.println("[SENSORS] --- acquire done ---");
 }
 
-// ---- publish the stored readings (no sensor access) ----
+// ---- publish the stored newest result of every sensor (no sensor access) ----
 void sensors_publishLatest() {
     if (!deviceOnline || mqttPublishQueue == NULL || !slotMutex) {
         Serial.println("[PUBLISH] offline - skipped (data is on the SD card)");
@@ -164,45 +173,147 @@ void sensors_publishLatest() {
         xSemaphoreTake(slotMutex, portMAX_DELAY);
         sl = slots[i];
         xSemaphoreGive(slotMutex);
-        if (!sl.used) continue;
+        if (!sl.used || !sl.valid) continue;
 
         MQTTMessage msg = {};
         strncpy(msg.topic, MQTT_PUB.c_str(), sizeof(msg.topic) - 1);
 
         bool sdi = (strcmp(sl.type, "sdi12") == 0 || strcmp(sl.type, "sdi-12") == 0 || strcmp(sl.type, "radar") == 0);
-        const char *ts = sl.ts[0] ? sl.ts : "000000000000";
 
         if (dataFormat == FMT_LEGACY && sdi) {
             snprintf(msg.payload, sizeof(msg.payload), "%s,%s+%.2f+%.2f+%s",
-                     DEVICE_ID.c_str(), sl.raw, sl.batt, sl.solar, ts);
+                     DEVICE_ID.c_str(), sl.raw, sl.batt, sl.solar, sl.ts);
         } else {
             snprintf(msg.payload, sizeof(msg.payload),
                 "{\"ts\":\"%s\",\"aos\":%s,\"device_id\":\"%s\",\"type\":\"data\","
                 "\"source\":\"%s\",\"sensor_id\":%d,\"sensor_name\":\"%s\"%s,\"data\":[%s]}",
-                ts, getAOS() ? "true" : "false", DEVICE_ID.c_str(),
+                sl.ts, getAOS() ? "true" : "false", DEVICE_ID.c_str(),
                 sl.type, sl.id, sl.name,
-                (showStale && sl.everRead && !sl.lastOk) ? ",\"stale\":true" : "",
+                (showStale && sl.stale) ? ",\"stale\":true" : "",
                 sl.channels);
         }
         msg.retries = 0;
 
-        if (xQueueSend(mqttPublishQueue, &msg, pdMS_TO_TICKS(100)) == pdTRUE)
-            Serial.printf("[PUBLISH] %s queued%s\n", sl.name, (sl.everRead && !sl.lastOk) ? " (previous reading)" : "");
-        else
+        if (xQueueSend(mqttPublishQueue, &msg, pdMS_TO_TICKS(100)) == pdTRUE) {
+            Serial.printf("[PUBLISH] %s queued at %s, data time %s%s\n", sl.name, nowPretty().c_str(),
+                          prettyTs(sl.ts).c_str(), sl.stale ? " (previous reading)" : "");
+            if (sl.fromGood) {                       // count publications of the good reading
+                xSemaphoreTake(slotMutex, portMAX_DELAY);
+                if (slots[i].gPubCount < 255) slots[i].gPubCount++;
+                xSemaphoreGive(slotMutex);
+            }
+        } else
             Serial.println("[PUBLISH] MQTT queue full");
     }
     sendLedCommand(LED_RF_HB);
 }
 
-// Kept for compatibility: read now, then publish
-void readAllSensorsAndPublish() {
-    sensors_acquire();
+// ---- one schedule slot: read -> wait for S -> decide -> SD log -> publish ----
+static void runSlot(uint32_t S) {
+    bool haveRtc = storage_getEpoch() != 0;
+    String slotPretty = haveRtc ? prettyTs(storage_tsFromEpoch(S)) : String("(no RTC)");
+    Serial.printf("[SLOT] reading START at %s  -> data time (slot) = %s\n", nowPretty().c_str(), slotPretty.c_str());
+
+    readAllSensors();
+    Serial.printf("[SLOT] reading END   at %s\n", nowPretty().c_str());
+
+    // Result ready before S: hold it until the exact slot time
+    uint32_t t0 = millis();
+    while (sensors_scheduleNow() < S && millis() - t0 < 600000UL) vTaskDelay(pdMS_TO_TICKS(200));
+
+    String ts = haveRtc ? storage_tsFromEpoch(S) : getTimestamp14();
+    Serial.printf("[SLOT] slot time reached/passed: now %s, logging + publishing as %s\n",
+                  nowPretty().c_str(), prettyTs(ts).c_str());
+
+    for (int i = 0; i < MAX_SLOTS; i++) {
+        ReadRes &r = results[i];
+        if (!r.used) continue;
+
+        xSemaphoreTake(slotMutex, portMAX_DELAY);
+        SensorSlot &sl = slots[i];
+        copyStr(sl.ts, sizeof(sl.ts), ts.c_str());
+
+        if (r.ok) {
+            // fresh data
+            copyStr(sl.channels, sizeof(sl.channels), r.channels);
+            copyStr(sl.raw, sizeof(sl.raw), r.raw);
+            sl.batt = r.batt; sl.solar = r.solar;
+            sl.stale = false;
+            copyStr(sl.gChannels, sizeof(sl.gChannels), r.channels);
+            copyStr(sl.gRaw, sizeof(sl.gRaw), r.raw);
+            sl.gBatt = r.batt; sl.gSolar = r.solar;
+            sl.haveGood = true;
+            sl.fromGood = true;
+            sl.gPubCount = 0;
+        } else if (sl.haveGood && sl.gPubCount < 2) {
+            // failed slot: repeat the last good reading (a reading is published at most 2 times)
+            copyStr(sl.channels, sizeof(sl.channels), sl.gChannels);
+            copyStr(sl.raw, sizeof(sl.raw), sl.gRaw);
+            sl.batt = r.batt; sl.solar = r.solar;
+            sl.stale = true;
+            sl.fromGood = true;
+            Serial.printf("[SLOT] %s failed -> previous reading used (%s)\n", sl.name, r.raw);
+        } else {
+            // that reading was already published twice (or none exists): report the real reason
+            copyStr(sl.channels, sizeof(sl.channels), r.channels);
+            copyStr(sl.raw, sizeof(sl.raw), r.raw);
+            sl.batt = r.batt; sl.solar = r.solar;
+            sl.stale = false;
+            sl.fromGood = false;
+            Serial.printf("[SLOT] %s failed again -> error reported: %s\n", sl.name, r.raw);
+        }
+        sl.valid = true;
+        String name = sl.name, raw = sl.raw;
+        bool isSdi = (strcmp(sl.type, "sdi12") == 0 || strcmp(sl.type, "sdi-12") == 0 || strcmp(sl.type, "radar") == 0);
+        float vb = sl.batt, vs = sl.solar;
+        xSemaphoreGive(slotMutex);
+
+        // SD logging: always, online or not, stamped with the slot time
+        storage_logDataAt(name, raw, ts);
+
+        // OLED shows exactly what was logged / is published (same reading, same battery/solar)
+        if (isSdi) { radarShowReading(raw.c_str()); updateVoltages(vb, vs); }
+    }
+
+    // Publish: now if online, otherwise wait up to 90 s for the connection, else skip
+    uint32_t w0 = millis();
+    while (!deviceOnline && millis() - w0 < 90000UL) vTaskDelay(pdMS_TO_TICKS(500));
     sensors_publishLatest();
+    Serial.printf("[SLOT] done, slot=%u\n", (unsigned)S);
+}
+
+// ---- read now (boot, MQTT data_read): updates "latest" with the current time, no SD log ----
+static void readNow() {
+    readAllSensors();
+    String ts = getTimestamp14();
+    for (int i = 0; i < MAX_SLOTS; i++) {
+        ReadRes &r = results[i];
+        if (!r.used) continue;
+        xSemaphoreTake(slotMutex, portMAX_DELAY);
+        SensorSlot &sl = slots[i];
+        copyStr(sl.ts, sizeof(sl.ts), ts.c_str());
+        copyStr(sl.channels, sizeof(sl.channels), r.channels);
+        copyStr(sl.raw, sizeof(sl.raw), r.raw);
+        sl.batt = r.batt; sl.solar = r.solar;
+        sl.stale = false;
+        sl.valid = true;
+        sl.fromGood = r.ok;
+        if (r.ok) {
+            copyStr(sl.gChannels, sizeof(sl.gChannels), r.channels);
+            copyStr(sl.gRaw, sizeof(sl.gRaw), r.raw);
+            sl.gBatt = r.batt; sl.gSolar = r.solar;
+            sl.haveGood = true;
+            sl.gPubCount = 0;
+        }
+        bool isSdi = (strcmp(sl.type, "sdi12") == 0 || strcmp(sl.type, "sdi-12") == 0 || strcmp(sl.type, "radar") == 0);
+        String raw = sl.raw;
+        float vb = sl.batt, vs = sl.solar;
+        xSemaphoreGive(slotMutex);
+        if (isSdi) { radarShowReading(raw.c_str()); updateVoltages(vb, vs); }
+    }
 }
 
 // ---- acquisition task ----
-// Measures so the result is ready before the publish time:
-//   publish times are multiples of DATA_INTERVAL (RTC aligned), reading starts LEAD seconds before.
 static volatile bool g_publishAfterRead = false;
 
 void sensors_requestReadAndPublish() {
@@ -211,31 +322,36 @@ void sensors_requestReadAndPublish() {
 }
 
 static void sensorTask(void *) {
-    uint32_t lastMeasuredSlot = 0;
-    bool first = true;                       // one reading right at start so "data" has something
+    uint32_t slotDone = 0;          // last slot that was processed
+    bool bootRead = true;
 
     for (;;) {
         bool force = ulTaskNotifyTake(pdTRUE, 0) > 0;
 
         uint32_t iv = DATA_INTERVAL / 1000;
-        if (iv < 30) iv = 30;
+        if (iv < 60) iv = 300;
         uint32_t now = sensors_scheduleNow();
-        uint32_t nextSlot = (now / iv + 1) * iv;
 
-        // lead = 3.5 min, or the last real measurement time + 30 s if that is longer
-        uint32_t lead = 210;
+        // lead = readLeadSec (default 3 min, MQTT set_read_lead), or the last real measurement
+        // time + 20 s if that is longer
+        uint32_t lead = readLeadSec;
         uint32_t lastMs = radarLastMeasureMs();
-        if (lastMs / 1000 + 30 > lead) lead = lastMs / 1000 + 30;
+        if (lastMs / 1000 + 20 > lead) lead = lastMs / 1000 + 20;
 
-        if (first || force || (nextSlot != lastMeasuredSlot && now + lead >= nextSlot)) {
-            first = false;
-            lastMeasuredSlot = nextSlot;
-            sensors_acquire();
-            updateVoltages(storage_getBatteryVoltage(), storage_getSolarVoltage());
-            if (g_publishAfterRead) {        // MQTT "data_read"
-                g_publishAfterRead = false;
-                sensors_publishLatest();
-            }
+        // next slot to process: the one after the last done, otherwise the next clock boundary
+        uint32_t S = slotDone ? slotDone + iv : (now / iv + 1) * iv;
+        if (S % iv != 0 || S + 2 * iv < now) S = (now / iv + 1) * iv;   // interval changed / far behind
+
+        if (force) {                                 // MQTT data_read
+            readNow();
+            if (g_publishAfterRead) { g_publishAfterRead = false; sensors_publishLatest(); }
+        } else if (now + lead >= S) {                // time to start this slot's reading
+            bootRead = false;
+            runSlot(S);
+            slotDone = S;
+        } else if (bootRead) {                       // after boot: fill "latest" (display, MQTT data)
+            bootRead = false;
+            readNow();
         }
         vTaskDelay(pdMS_TO_TICKS(500));
     }
